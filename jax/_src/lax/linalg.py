@@ -1848,12 +1848,13 @@ def _schur_cpu_gpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_val
   operand_aval, = ctx.avals_in
   batch_dims = operand_aval.shape[:-2]
   real = operand_aval.dtype == np.float32 or operand_aval.dtype == np.float64
-  mode = (
+
+  if target_name_prefix == "cpu":
+    mode = (
       lapack.schur.ComputationMode.kComputeSchurVectors
       if compute_schur_vectors
       else lapack.schur.ComputationMode.kNoComputeSchurVectors
-  )
-  if target_name_prefix == "cpu":
+    )
     mode_ = _enum_attr(mode)
     sort_ = _enum_attr(lapack.schur.Sort.kNoSortEigenvalues)
     target_name = lapack.prepare_lapack_call("gees_ffi", operand_aval.dtype)
