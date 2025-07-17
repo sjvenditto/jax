@@ -890,5 +890,313 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kEigComp, EigCompDispatch,
                                   .Ret<ffi::Buffer<ffi::S32>>()  // info
 );
 
+// Real-valued Schur decompositiofn
+
+template <ffi::DataType DataType>
+class SchurRealHost {
+  using Real = ffi::NativeType<DataType>;
+
+ public:
+  explicit SchurRealHost() = default;
+  SchurRealHost(SchurRealHost&&) = default;
+
+  absl::StatusOr<int> lwork(int n, bool mode, bool sort) {
+    n_ = n;
+    mode_ = mode ? 'V' : 'N';
+    sort_ = sort ? 'S' : 'N';
+    int64_t lwork = SchurDecomposition<DataType>::GetWorkspaceSize(
+        n, static_cast<schur::ComputationMode>(mode_),
+        static_cast<schur::Sort>(sort_));
+    return MaybeCastNoOverflow<int>(lwork);
+  }
+
+  void compute(Real* x, Real* vs, Real* wr, Real* wi, int* sdim, Real* work,
+               int lwork, int* info) {
+    SchurDecomposition<DataType>::fn(&mode_, &sort_, nullptr, &n_, x, &n_, sdim, wr,
+                                     wi, vs, &n_, work, &lwork, nullptr, info);
+  }
+
+ private:
+  int n_;
+  char mode_, sort_;
+};
+
+template <ffi::DataType DataType, typename Impl>
+ffi::Error SchurReal(Impl impl, int64_t batch, int64_t cols, gpuStream_t stream,
+                   bool mode, bool sort, ffi::AnyBuffer x,
+                   ffi::Result<ffi::AnyBuffer> x_out,
+                   ffi::Result<ffi::AnyBuffer> vs,
+                   ffi::Result<ffi::AnyBuffer> wr,
+                   ffi::Result<ffi::AnyBuffer> wi,
+                   ffi::Result<ffi::Buffer<ffi::S32>> sdim,
+                   ffi::Result<ffi::Buffer<ffi::S32>> info) {
+  using Real = ffi::NativeType<DataType>;
+  // using Complex = ffi::NativeType<ffi::ToComplex(DataType)>;
+
+  auto x_host = HostBuffer<Real>(x.element_count());
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyFromDevice(stream, x.typed_data<Real>()));
+
+  // auto xout_host = HostBuffer<Real>(batch * cols);
+  auto vs_host = HostBuffer<Real>(batch * cols * cols);
+  auto wr_host = HostBuffer<Real>(batch * cols);
+  auto wi_host = HostBuffer<Real>(batch * cols);
+  auto sdim_host = HostBuffer<int>(batch);
+  auto info_host = HostBuffer<int>(batch);
+
+  FFI_ASSIGN_OR_RETURN(int n, MaybeCastNoOverflow<int>(cols));
+  FFI_ASSIGN_OR_RETURN(int lwork, impl.lwork(n, mode, sort));
+  auto work_host = AllocateScratchMemory<DataType>(lwork);
+
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+
+  const auto is_finite = [](auto* data, int64_t size) {
+    return absl::c_all_of(absl::MakeSpan(data, size),
+                          [](auto value) { return std::isfinite(value); });
+  };
+
+  for (int64_t i = 0; i < batch; ++i) {
+    if (is_finite(x_host.get() + i * cols * cols, cols * cols)) {
+      impl.compute(x_host.get() + i * cols * cols, vs_host.get() + i * cols * cols,
+                   wr_host.get() + i * cols, wi_host.get() + i * cols, sdim_host.get() + i, 
+                   work_host.get(), lwork, info_host.get() + i);
+    } else {
+      info_host.get()[i] = -4;
+    }
+  }
+
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyToDevice(stream, x_out->typed_data<Real>()));
+  if (mode) {
+    FFI_RETURN_IF_ERROR_STATUS(
+        vs_host.CopyToDevice(stream, vs->typed_data<Real>()));
+  }
+  FFI_RETURN_IF_ERROR_STATUS(
+      wr_host.CopyToDevice(stream, wr->typed_data<Real>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      wi_host.CopyToDevice(stream, wi->typed_data<Real>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      sdim_host.CopyToDevice(stream, sdim->typed_data()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      info_host.CopyToDevice(stream, info->typed_data()));
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+
+  return ffi::Error::Success();
+}
+
+ffi::Error SchurRealDispatch(gpuStream_t stream, 
+                           bool mode, bool sort, ffi::AnyBuffer x,
+                           ffi::Result<ffi::AnyBuffer> x_out,
+                           ffi::Result<ffi::AnyBuffer> vs,
+                           ffi::Result<ffi::AnyBuffer> wr,
+                           ffi::Result<ffi::AnyBuffer> wi,
+                           ffi::Result<ffi::Buffer<ffi::S32>> sdim,
+                           ffi::Result<ffi::Buffer<ffi::S32>> info) {
+  auto dataType = x.element_type();
+  if (dataType != wr->element_type() || dataType != wi->element_type() ||
+      dataType != vs->element_type()) {
+    return ffi::Error::InvalidArgument(
+        "The inputs and outputs to schur must have the same element type");
+  }
+
+  FFI_ASSIGN_OR_RETURN((auto [batch, rows, cols]),
+                       SplitBatch2D(x.dimensions()));
+  if (rows != cols) {
+    return ffi::Error::InvalidArgument(
+        "The input matrix to schur must be square");
+  }
+  if (mode) {
+    FFI_RETURN_IF_ERROR(
+        CheckShape(vs->dimensions(), {batch, rows, cols}, "vs", "schur"));
+  }
+  FFI_RETURN_IF_ERROR(CheckShape(wr->dimensions(), {batch, cols}, "wr", "schur"));
+  FFI_RETURN_IF_ERROR(CheckShape(wi->dimensions(), {batch, cols}, "wi", "schur"));
+  FFI_RETURN_IF_ERROR(CheckShape(sdim->dimensions(), batch, "sdim", "schur"));
+  FFI_RETURN_IF_ERROR(CheckShape(info->dimensions(), batch, "info", "schur"));
+
+  // bool use_magma = magma == "on";
+  // if
+  // if (magma == "auto" && cols >= 2048) {
+  //   use_magma = FindMagmaSymbol("magma_init").ok();
+  // }
+
+  switch (dataType) {
+    case ffi::F32:
+      return SchurReal<ffi::F32>(SchurRealHost<ffi::F32>(), batch, cols, stream,
+                                 mode, sort, x, x_out, vs, wr, wi, sdim, info);
+    case ffi::F64:
+      return SchurReal<ffi::F64>(SchurRealHost<ffi::F64>(), batch, cols, stream,
+                                 mode, sort, x, x_out, vs, wr, wi, sdim, info);
+    default:
+      return ffi::Error::InvalidArgument(absl::StrFormat(
+          "Unsupported dtype %s in schur_real", absl::FormatStreamed(dataType)));
+  }
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kSchurReal, SchurRealDispatch,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<gpuStream_t>>()
+                                  .Attr<bool>("mode")
+                                  .Attr<bool>("sort")
+                                  .Arg<ffi::AnyBuffer>()         // x
+                                  .Ret<ffi::AnyBuffer>()         // x_out
+                                  .Ret<ffi::AnyBuffer>()         // vs
+                                  .Ret<ffi::AnyBuffer>()         // wr
+                                  .Ret<ffi::AnyBuffer>()         // wi
+                                  .Ret<ffi::Buffer<ffi::S32>>()  // sdim
+                                  .Ret<ffi::Buffer<ffi::S32>>()  // info
+);
+
+// Complex-valued Schur decomposition
+
+template <ffi::DataType DataType>
+class SchurCompHost {
+  using Real = ffi::NativeType<ffi::ToReal(DataType)>;
+  using Complex = ffi::NativeType<DataType>;
+
+ public:
+  explicit SchurCompHost() = default;
+  SchurCompHost(SchurCompHost&&) = default;
+
+  absl::StatusOr<int> lwork(int n, bool mode, bool sort) {
+    n_ = n;
+    mode_ = mode ? 'V' : 'N';
+    sort_ = sort ? 'S' : 'N';
+    int64_t lwork = SchurDecompositionComplex<DataType>::GetWorkspaceSize(
+        n, static_cast<schur::ComputationMode>(mode_),
+        static_cast<schur::Sort>(sort_));
+    return MaybeCastNoOverflow<int>(lwork);
+  }
+
+  void compute(Complex* x, Complex* vs, Complex* w, int* sdim, Complex* work,
+               int lwork, Real* rwork, int* info) {
+    SchurDecompositionComplex<DataType>::fn(&mode_, &sort_, nullptr, &n_, x, &n_,
+                                            sdim, w, vs, &n_, work,
+                                            &lwork, rwork, nullptr, info);
+  }
+
+ private:
+  int n_;
+  char mode_, sort_;
+};
+
+template <ffi::DataType DataType, typename Impl>
+ffi::Error SchurComp(Impl impl, int64_t batch, int64_t cols, gpuStream_t stream,
+                   bool mode, bool sort, ffi::AnyBuffer x,
+                   ffi::Result<ffi::AnyBuffer> x_out,
+                   ffi::Result<ffi::AnyBuffer> vs,
+                   ffi::Result<ffi::AnyBuffer> w,
+                   ffi::Result<ffi::Buffer<ffi::S32>> sdim,
+                   ffi::Result<ffi::Buffer<ffi::S32>> info) {
+  using Complex = ffi::NativeType<DataType>;
+
+  auto x_host = HostBuffer<Complex>(x.element_count());
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyFromDevice(stream, x.typed_data<Complex>()));
+
+  auto w_host = HostBuffer<Complex>(batch * cols);
+  auto vs_host = HostBuffer<Complex>(batch * cols * cols);
+  auto sdim_host = HostBuffer<int>(batch);
+  auto info_host = HostBuffer<int>(batch);
+
+  FFI_ASSIGN_OR_RETURN(int n, MaybeCastNoOverflow<int>(cols));
+  FFI_ASSIGN_OR_RETURN(int lwork, impl.lwork(n, mode, sort));
+  auto work_host = AllocateScratchMemory<DataType>(lwork);
+  auto rwork_host =
+      AllocateScratchMemory<ffi::ToReal(DataType)>(2 * cols * cols);
+
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+
+  const auto is_finite = [](auto* data, int64_t size) {
+    return absl::c_all_of(absl::MakeSpan(data, size), [](const auto& z) {
+      return std::isfinite(z.real()) && std::isfinite(z.imag());
+    });
+  };
+
+  for (int64_t i = 0; i < batch; ++i) {
+    if (is_finite(x_host.get() + i * cols * cols, cols * cols)) {
+      impl.compute(x_host.get() + i * cols * cols, vs_host.get() + i * cols * cols,
+                   w_host.get() + i * cols, sdim_host.get() + i,
+                   work_host.get(), lwork, rwork_host.get(), info_host.get() + i);
+    } else {
+      info_host.get()[i] = -4;
+    }
+  }
+
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyToDevice(stream, x_out->typed_data<Complex>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      sdim_host.CopyToDevice(stream, sdim->typed_data()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      w_host.CopyToDevice(stream, w->typed_data<Complex>()));
+  if (mode) {
+    FFI_RETURN_IF_ERROR_STATUS(
+        vs_host.CopyToDevice(stream, vs->typed_data<Complex>()));
+  }
+  FFI_RETURN_IF_ERROR_STATUS(
+      info_host.CopyToDevice(stream, info->typed_data()));
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+
+  return ffi::Error::Success();
+}
+
+ffi::Error SchurCompDispatch(gpuStream_t stream,
+                           bool mode, bool sort, ffi::AnyBuffer x,
+                           ffi::Result<ffi::AnyBuffer> x_out,
+                           ffi::Result<ffi::AnyBuffer> vs,
+                           ffi::Result<ffi::AnyBuffer> w,
+                           ffi::Result<ffi::Buffer<ffi::S32>> sdim,
+                           ffi::Result<ffi::Buffer<ffi::S32>> info) {
+  auto dataType = x.element_type();
+  if (dataType != w->element_type() || dataType != vs->element_type()) {
+    return ffi::Error::InvalidArgument(
+        "The inputs and outputs to schur must have the same element type");
+  }
+
+  FFI_ASSIGN_OR_RETURN((auto [batch, rows, cols]),
+                       SplitBatch2D(x.dimensions()));
+  if (rows != cols) {
+    return ffi::Error::InvalidArgument(
+        "The input matrix to schur must be square");
+  }
+  if (mode) {
+    FFI_RETURN_IF_ERROR(
+        CheckShape(vs->dimensions(), {batch, rows, cols}, "vs", "schur"));
+  }
+  FFI_RETURN_IF_ERROR(CheckShape(w->dimensions(), {batch, cols}, "w", "schur"));
+  FFI_RETURN_IF_ERROR(CheckShape(sdim->dimensions(), batch, "sdim", "schur"));
+  FFI_RETURN_IF_ERROR(CheckShape(info->dimensions(), batch, "info", "schur"));
+
+  // bool use_magma = magma == "on";
+  // if (magma == "auto" && cols >= 2048) {
+  //   use_magma = FindMagmaSymbol("magma_init").ok();
+  // }
+
+  switch (dataType) {
+    case ffi::C64:
+      return SchurComp<ffi::C64>(SchurCompHost<ffi::C64>(), batch, cols, stream,
+                                 mode, sort, x, x_out, vs, w, sdim, info);
+    case ffi::C128:
+      return SchurComp<ffi::C128>(SchurCompHost<ffi::C128>(), batch, cols, stream,
+                                 mode, sort, x, x_out, vs, w, sdim, info);
+    default:
+      return ffi::Error::InvalidArgument(absl::StrFormat(
+          "Unsupported dtype %s in schur_comp", absl::FormatStreamed(dataType)));
+  }
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kSchurComp, SchurCompDispatch,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<gpuStream_t>>()
+                                  .Attr<bool>("mode")
+                                  .Attr<bool>("sort")
+                                  .Arg<ffi::AnyBuffer>()         // x
+                                  .Ret<ffi::AnyBuffer>()         // x_out
+                                  .Ret<ffi::AnyBuffer>()         // vs
+                                  .Ret<ffi::AnyBuffer>()         // w
+                                  .Ret<ffi::Buffer<ffi::S32>>()  // sdim
+                                  .Ret<ffi::Buffer<ffi::S32>>()  // info
+);
+
 }  // namespace JAX_GPU_NAMESPACE
 }  // namespace jax

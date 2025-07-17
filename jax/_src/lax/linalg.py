@@ -1838,8 +1838,8 @@ def _schur_dtype_rule(dtype, *, compute_schur_vectors, **_):
   dtype = dtypes.canonicalize_dtype(dtype)
   return (dtype, dtype) if compute_schur_vectors else (dtype,)
 
-def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
-                        select_callable):
+def _schur_cpu_gpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
+                        select_callable, target_name_prefix):
   del select_callable  # unused
   if sort_eig_vals:
     raise NotImplementedError(
@@ -1848,7 +1848,25 @@ def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
   operand_aval, = ctx.avals_in
   batch_dims = operand_aval.shape[:-2]
   real = operand_aval.dtype == np.float32 or operand_aval.dtype == np.float64
-  target_name = lapack.prepare_lapack_call("gees_ffi", operand_aval.dtype)
+
+  if target_name_prefix == "cpu":
+    mode = (
+      lapack.schur.ComputationMode.kComputeSchurVectors
+      if compute_schur_vectors
+      else lapack.schur.ComputationMode.kNoComputeSchurVectors
+    )
+    mode_ = _enum_attr(mode)
+    sort_ = _enum_attr(lapack.schur.Sort.kNoSortEigenvalues)
+    target_name = lapack.prepare_lapack_call("gees_ffi", operand_aval.dtype)
+
+  else:
+    gpu_solver.initialize_hybrid_kernels()
+    mode_ = compute_schur_vectors
+    sort_ = False
+    if real:
+      target_name = f"{target_name_prefix}hybrid_schur_real"
+    else:
+      target_name = f"{target_name_prefix}hybrid_schur_comp"
 
   info_aval = ShapedArray(batch_dims, np.dtype(np.int32))
   eigvals_aval = ShapedArray(operand_aval.shape[:-1], operand_aval.dtype)
@@ -1858,16 +1876,11 @@ def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
   else:
     avals_out = [operand_aval, operand_aval, eigvals_aval, info_aval, info_aval]
 
-  mode = (
-      lapack.schur.ComputationMode.kComputeSchurVectors
-      if compute_schur_vectors
-      else lapack.schur.ComputationMode.kNoComputeSchurVectors
-  )
   rule = _linalg_ffi_lowering(target_name, avals_out=avals_out,
                               operand_output_aliases={0: 0})
   schur_form, schur_vectors, *_, info = rule(
-      ctx, operand, mode=_enum_attr(mode),
-      sort=_enum_attr(lapack.schur.Sort.kNoSortEigenvalues))
+      ctx, operand, mode=mode_,
+      sort=sort_)
 
   ok = mlir.compare_hlo(
       info, mlir.full_like_aval(ctx, 0, ShapedArray(batch_dims, np.dtype(np.int32))),
@@ -1886,7 +1899,7 @@ def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
 schur_p = linalg_primitive(
     _schur_dtype_rule, (_float | _complex,), (2,), _schur_shape_rule, "schur",
     multiple_results=True)
-mlir.register_lowering(schur_p, _schur_cpu_lowering, platform="cpu")
+register_cpu_gpu_lowering(schur_p, _schur_cpu_gpu_lowering)
 
 
 # Singular value decomposition

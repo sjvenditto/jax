@@ -1952,7 +1952,7 @@ class ScipyLinalgTest(jtu.JaxTestCase):
       shape=[(4, 4), (15, 15), (50, 50), (100, 100)],
       dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
   def testSchur(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
@@ -1981,7 +1981,8 @@ class ScipyLinalgTest(jtu.JaxTestCase):
   )
   # funm uses jax.scipy.linalg.schur which is implemented for a CPU
   # backend only, so tests on GPU and TPU backends are skipped here
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
+  @jax.default_matmul_precision("float32")
   def testFunm(self, shape, dtype, disp):
 
     def func(x):
@@ -2004,7 +2005,7 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     shape=[(4, 4), (15, 15), (50, 50), (100, 100)],
     dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
   def testSqrtmPSDMatrix(self, shape, dtype):
     # Checks against scipy.linalg.sqrtm when the principal square root
     # is guaranteed to be unique (i.e no negative real eigenvalue)
@@ -2027,7 +2028,8 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     shape=[(4, 4), (15, 15), (50, 50), (100, 100)],
     dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
+  @jax.default_matmul_precision("float32")
   def testSqrtmGenMatrix(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     arg = rng(shape, dtype)
@@ -2046,7 +2048,7 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     ],
     dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
   def testSqrtmEdgeCase(self, diag, expected, dtype):
     """
     Tests the zero numerator condition
@@ -2258,7 +2260,8 @@ class LaxLinalgTest(jtu.JaxTestCase):
     shape=[(4, 4), (15, 15), (50, 50), (100, 100)],
     dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
+  @jax.default_matmul_precision("float32")
   def testSchur(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     args = rng(shape, dtype)
@@ -2266,14 +2269,14 @@ class LaxLinalgTest(jtu.JaxTestCase):
     eps = np.finfo(dtype).eps
     self.assertAllClose(args, Ss @ Ts @ jnp.conj(Ss.T), atol=600 * eps)
     self.assertAllClose(
-        np.eye(*shape, dtype=dtype), Ss @ jnp.conj(Ss.T), atol=100 * eps
-    )
+        np.eye(*shape, dtype=dtype), Ss @ jnp.conj(Ss.T), atol=100 * eps)
 
   @jtu.sample_product(
     shape=[(2, 2), (4, 4), (15, 15), (50, 50), (100, 100)],
     dtype=float_types + complex_types,
   )
-  @jtu.run_on_devices("cpu")
+  @jtu.run_on_devices("cpu","gpu")
+  @jax.default_matmul_precision("float32")
   def testSchurBatching(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
     batch_size = 10
