@@ -748,6 +748,16 @@ def warp_barrier():
   nvvm.bar_warp_sync(c(0xffffffff, ir.IntegerType.get_signless(32)))
 
 
+def system_memory_barrier():
+  llvm.inline_asm(
+      ir.Type.parse("!llvm.void"),
+      [],
+      "fence.sys;",
+      "",
+      has_side_effects=True,
+  )
+
+
 @dataclasses.dataclass(frozen=True)
 class BarrierRef:
   base_address: ir.Value
@@ -1553,6 +1563,11 @@ def is_known_divisible(value, divisor, max_depth=10) -> bool:
 def smem() -> ir.Attribute:
   """Returns the attribute for the SMEM memory space."""
   return ir.Attribute.parse("#gpu.address_space<workgroup>")
+
+
+def tmem() -> ir.Attribute:
+  """Returns the attribute for the TMEM memory space."""
+  return ir.Attribute.parse("#mosaic_gpu.tmem")
 
 
 def is_smem_ref(ref: ir.Value | ir.Type) -> bool:

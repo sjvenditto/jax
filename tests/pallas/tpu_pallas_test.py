@@ -1238,6 +1238,70 @@ class PallasCallDMATest(PallasBaseTest):
     )(x)
     np.testing.assert_array_equal(y, x)
 
+  def test_host_input_host_to_hbm_dma(self):
+    if self.INTERPRET:
+      self.skipTest('Interpret mode does not support host memory.')
+    if not jtu.if_cloud_tpu_at_least(2025, 7, 12):
+      self.skipTest("Requires libtpu built after 2025-07-12")
+    def kernel(x_host_ref, y_hbm_ref):
+      def body(sem):
+        pltpu.async_copy(x_host_ref, y_hbm_ref, sem).wait()
+
+      pl.run_scoped(body, pltpu.SemaphoreType.DMA)
+
+    x = jnp.arange(8 * 128.0).reshape((8, 128))
+    # Move input to the host.
+    x = jax.device_put(
+        x,
+        jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), 'x'),
+            jax.sharding.PartitionSpec(),
+            memory_kind='pinned_host',
+        ),
+    )
+    y = self.pallas_call(
+        kernel,
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.HOST),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_host_input_hbm_to_host_dma(self):
+    if self.INTERPRET:
+      self.skipTest('Interpret mode does not support host memory.')
+    if not jtu.if_cloud_tpu_at_least(2025, 7, 12):
+      self.skipTest("Requires libtpu built after 2025-07-12")
+    def kernel(x_host_ref, y_hbm_ref, _):
+      def body(sem):
+        pltpu.async_copy(y_hbm_ref, x_host_ref, sem).wait()
+
+      pl.run_scoped(body, pltpu.SemaphoreType.DMA)
+
+    x = jnp.arange(8 * 128.0).reshape((8, 128))
+    y = jnp.ones((8, 128))
+    # Move input to the host.
+    x = jax.device_put(
+        x,
+        jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), 'x'),
+            jax.sharding.PartitionSpec(),
+            memory_kind='pinned_host',
+        ),
+    )
+    z = self.pallas_call(
+        kernel,
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.HOST),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )(x, y)
+    np.testing.assert_array_equal(x, y)
+
   def test_cannot_dma_with_nonscalar_semaphore_ref(self):
     def kernel(x_hbm_ref, y_hbm_ref):
       def body(sem):
@@ -1693,6 +1757,24 @@ class PallasCallDMATest(PallasBaseTest):
     )
     result = run(array, data, index, size)
     np.testing.assert_array_equal(result, expected)
+
+  def test_unused_dma_descriptor_error(self):
+    x = jnp.arange(8 * 128.0).reshape((8, 128))
+
+    @functools.partial(
+        pl.pallas_call,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+        scratch_shapes=[pltpu.SemaphoreType.DMA],
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    )
+    def kernel(x_hbm_ref, o_hbm_ref, sem):
+      pltpu.make_async_copy(x_hbm_ref, o_hbm_ref, sem)
+
+    with self.assertLogs(level='ERROR') as log:
+      kernel(x)
+    [message] = log.output
+    self.assertIn('AsyncCopyDescriptor was not used', message)
 
 
 class PallasCallDMAInterpretTest(PallasCallDMATest):
@@ -2989,33 +3071,48 @@ class MiscellaneousTest(PallasBaseTest):
     )(x)
     np.testing.assert_array_equal(out, state_utils.bitcast(x, jnp.uint32))
 
-  def test_roll_partial_with_static_shift(self):
-    if not jtu.if_cloud_tpu_at_least(2025, 5, 15):
-      self.skipTest('Needs a newer libtpu')
-    x = np.arange(8192, dtype=jnp.float32).reshape(128, 64)
+  @parameterized.product(
+      shape=((128, 64), (15, 256), (16, 256)),
+      shift=(2, 3),
+      axis=(0, 1),
+  )
+  def test_roll_partial_with_static_shift(
+      self, shape: tuple[int, int], shift: int, axis: int
+  ):
+    if (
+        not jtu.if_cloud_tpu_at_least(2025, 7, 19)
+        and shape[0] % 8
+        and axis == 0
+    ):
+      self.skipTest('Needs a newer libtpu for non-sublane-aligned shape')
+    x = np.arange(math.prod(shape), dtype=jnp.float32).reshape(shape)
 
     def kernel(x_ref, out_ref):
-      out_ref[...] = pltpu.roll(x_ref[...], 3, 1)
+      out_ref[...] = pltpu.roll(x_ref[...], shift=shift, axis=axis)
 
     out = self.pallas_call(
-        kernel, out_shape=jax.ShapeDtypeStruct((128, 64), jnp.float32)
+        kernel, out_shape=jax.ShapeDtypeStruct(shape, jnp.float32)
     )(x)
-    np.testing.assert_array_equal(out, np.roll(x, 3, 1))
+    np.testing.assert_array_equal(out, np.roll(x, shift, axis))
 
-  def test_roll_partial_with_dynamic_shift(self):
-    if not jtu.if_cloud_tpu_at_least(2025, 5, 15):
-      self.skipTest('Needs a newer libtpu')
+  @parameterized.product(
+      shape_and_axis=(((128, 64), 1), ((63, 256), 0)),
+  )
+  def test_roll_partial_with_dynamic_shift(
+      self, shape_and_axis: tuple[tuple[int, int], int]
+  ):
     if self.INTERPRET:
       self.skipTest('Test only applies to non-interpret mode.')
-    x = np.arange(8192, dtype=jnp.float32).reshape(128, 64)
+    shape, axis = shape_and_axis
+    x = np.arange(math.prod(shape), dtype=jnp.float32).reshape(shape)
 
     def kernel(x_ref, out_ref):
       amount = x_ref[0, 0].astype(jnp.int32)
-      out_ref[...] = pltpu.roll(x_ref[...], amount, 1)
+      out_ref[...] = pltpu.roll(x_ref[...], amount, axis=axis)
 
     with self.assertRaisesRegex(Exception, 'unsupported unaligned shape'):
       _ = self.pallas_call(
-          kernel, out_shape=jax.ShapeDtypeStruct((128, 64), jnp.float32)
+          kernel, out_shape=jax.ShapeDtypeStruct(shape, jnp.float32)
       )(x)
 
   def test_retiling1(self):

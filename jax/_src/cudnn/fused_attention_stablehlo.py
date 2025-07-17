@@ -367,9 +367,10 @@ def check_is_flash_attention(
         _, T, _, qH = query.shape
         _, S, _, vH = value.shape
 
-    if is_cuda_compute_capability_equal("10.3"):
-      # cudnn will fallback to ampere kernels on 10.3 which is not ideal
-      raise NotImplementedError("Unsupported compute capability 10.3.")
+    if is_cuda_compute_capability_equal("10.3") and cudnn_version < 91100:
+      # cudnn support compute_cap 10.3 on cudnn 9.11+
+      raise NotImplementedError(
+        "Compute capability 10.3 requires cuDNN version >= 9.11.")
 
     # Flash attention conditions
     if is_fp8:
@@ -1120,7 +1121,7 @@ batching.primitive_batchers[
 ] = _dot_product_attention_bwd_batcher
 
 def not_implemented_sharding_rule(*args, **kwargs):
-  return NotImplementedError("Sharding rule not implemented.")
+  raise NotImplementedError("Sharding rule not implemented.")
 
 _dot_product_attention_fwd_lower.def_partition(
   infer_sharding_from_operands=_dot_product_attention_fwd_infer_sharding_from_operands,
@@ -1715,14 +1716,16 @@ batching.primitive_batchers[
 
 _dot_product_attention_fp8_fwd_lower.def_partition(
   infer_sharding_from_operands=_dot_product_attention_fp8_fwd_infer_sharding_from_operands,
-  partition=_dot_product_attention_fp8_fwd_partition)
+  partition=_dot_product_attention_fp8_fwd_partition,
+  sharding_rule=not_implemented_sharding_rule)
 
 mlir.register_lowering(_dot_product_attention_fp8_fwd_p_wrapper,
                         mlir.lower_fun(_dot_product_attention_fp8_fwd_lower, multiple_results=True))
 
 _dot_product_attention_fp8_bwd_lower.def_partition(
   infer_sharding_from_operands=_dot_product_attention_fp8_bwd_infer_sharding_from_operands,
-  partition=_dot_product_attention_fp8_bwd_partition)
+  partition=_dot_product_attention_fp8_bwd_partition,
+  sharding_rule=not_implemented_sharding_rule)
 
 mlir.register_lowering(_dot_product_attention_fp8_bwd_p_wrapper,
                         mlir.lower_fun(_dot_product_attention_fp8_bwd_lower, multiple_results=True))

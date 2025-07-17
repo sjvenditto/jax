@@ -639,42 +639,10 @@ def _infer_params(
     phys_mesh = mesh_lib.thread_resources.env.physical_mesh
     with (_internal_use_concrete_mesh(phys_mesh),
           mesh_lib.use_abstract_mesh(phys_mesh.abstract_mesh)):
-      return _params_for_top_jit(_infer_params_internal(fun, ji, args, kwargs))
+      return _infer_params_internal(fun, ji, args, kwargs)
   else:
-    return _params_for_top_jit(_infer_params_internal(fun, ji, args, kwargs))
+    return _infer_params_internal(fun, ji, args, kwargs)
 
-def _params_for_top_jit(
-    p_and_args_flat: tuple[PjitParams, list[core.Value]]
-  ) -> tuple[PjitParams, list[core.Value]]:
-  if not config.use_simplified_jaxpr_constants.value:
-    return p_and_args_flat
-  # Normally for pjit we want to pass closed-over constants as inputs, not
-  # as `consts` in the embedded ClosedJaxpr. The `p.params['jaxpr']` contains
-  # such a ClosedJaxpr. But for the top-level jit, for now, we want to keep
-  # the calling convention where the consts are passed inside the ClosedJaxpr
-  # and are lowered as HLO constants, and only the actual inputs are passed
-  # as inputs. We have prepared such a ClosedJaxpr in `p.jaxpr_for_top_jit`,
-  # but we also need to adjust some other parameters and the `args_flat`.
-
-  # We cannot do this down the stack in `_infer_params_impl` because that
-  # function is under a cache which we don't want to be keyed on whether
-  # `core.trace_state_clean()`.
-  p, args_flat = p_and_args_flat
-  if (core.trace_state_clean() and
-      p.consts and
-      not any(isinstance(c, core.Tracer) or core.typeof(c).has_qdd for c in p.consts)):
-    new_jaxpr = p.jaxpr_for_top_jit
-    nr_consts = len(p.consts)
-    assert all(c is a for c, a in zip(new_jaxpr.consts, args_flat[:nr_consts]))
-    args_flat = args_flat[nr_consts:]
-    new_params = dict(p.params,
-                      jaxpr=new_jaxpr,
-                      in_shardings=p.params['in_shardings'][nr_consts:],
-                      in_layouts=p.params['in_layouts'][nr_consts:],
-                      donated_invars=p.params['donated_invars'][nr_consts:])
-    p = p._replace(consts=[], params=new_params)
-
-  return p, args_flat
 
 def _infer_params_internal(
     fun: Callable, ji: PjitInfo, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -1401,24 +1369,15 @@ def _create_pjit_jaxpr(
     from jax.experimental.key_reuse._core import check_key_reuse_jaxpr  # pytype: disable=import-error
     check_key_reuse_jaxpr(jaxpr)
 
-  if not config.use_simplified_jaxpr_constants.value:
-    # TODO(mattjj,yashkatariya): if we take the 'true' path then we *must* fall
-    # off the C++ dispatch fast path for correctness. Ensure that happens.
-    if any(isinstance(c, core.Tracer) or core.typeof(c).has_qdd for c in consts):
-      closed_jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(jaxpr))
-      final_consts = consts
-    else:
-      closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
-      final_consts = []
-    return closed_jaxpr, final_consts, closed_jaxpr, global_out_avals
+  # TODO(mattjj,yashkatariya): if we take the 'true' path then we *must* fall
+  # off the C++ dispatch fast path for correctness. Ensure that happens.
+  if any(isinstance(c, core.Tracer) or core.typeof(c).has_qdd for c in consts):
+    closed_jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(jaxpr))
+    final_consts = consts
   else:
-    # See comments in _params_for_top_jit for why we need two ClosedJaxpr. We
-    # prepare them both here, because this is under a cache, to ensure that
-    # we use the same exact ClosedJaxpr in future calls, which in turn will enable
-    # downstream lowering and compilation caches.
-    # TODO(necula): we can use `pe.close_jaxpr` once we fix https://github.com/jax-ml/jax/issues/29803
-    closed_jaxpr = core.ClosedJaxpr(pe.convert_constvars_jaxpr(jaxpr), ())
-    return closed_jaxpr, consts, core.ClosedJaxpr(jaxpr, consts), global_out_avals
+    closed_jaxpr = core.ClosedJaxpr(jaxpr, consts)
+    final_consts = []
+  return closed_jaxpr, final_consts, closed_jaxpr, global_out_avals
 
 
 @util.cache(max_size=4096, trace_context_in_key=False)
@@ -1527,7 +1486,6 @@ def _to_lojax(*hi_args, jaxpr, **params):
   jaxpr, closed_over_himutables = pe.convert_const_himutables(jaxpr)
   hi_args = [*closed_over_himutables, *hi_args]
   params = _converted_mutables_add_params(len(closed_over_himutables), **params)
-
 
   # expand pjit params that must match number of lo inputs/outputs
   lo_nums_in = [len(aval.lo_ty()) for aval in jaxpr.in_aval_qdds]
@@ -1916,6 +1874,12 @@ def _pjit_lower_cached(
 
 
 def pjit_staging_rule(trace, source_info, *args, **params):
+  if params["compiler_options_kvs"]:
+    raise ValueError(
+        '`compiler_options` can only be passed to top-level `jax.jit`. Got'
+        f' compiler_options={dict(params["compiler_options_kvs"])} specified on'
+        f' a nested jit with name: {params["name"]} and source info:'
+        f' {source_info_util.summarize(source_info)}')
   # If we're inlining, no need to compute forwarding information; the inlined
   # computation will in effect forward things.
   if (params["inline"] and
@@ -1966,7 +1930,6 @@ def pjit_staging_rule(trace, source_info, *args, **params):
   else:
     out_tracers = trace.default_process_primitive(
         jit_p, args, params, source_info=source_info)
-
   return out_tracers
 pe.custom_staging_rules[jit_p] = pjit_staging_rule
 
@@ -2276,11 +2239,11 @@ def _pjit_linearize(nzs, *primals_in, jaxpr, in_shardings, out_shardings,
     tangents_nz = _filter_zeros(nzs, tangents)
     nz_tangents_out = jit_p.bind(
         *residuals, *tangents_nz, jaxpr=tangent_jaxpr,
-        in_shardings=_filter_zeros(nzs, in_shardings) + res_shardings_in,
+        in_shardings=res_shardings_in + _filter_zeros(nzs, in_shardings),
         out_shardings=_filter_zeros(nzs_out, out_shardings),
-        in_layouts=_filter_zeros(nzs, in_layouts) + res_layouts_in,
+        in_layouts=res_layouts_in + _filter_zeros(nzs, in_layouts),
         out_layouts=_filter_zeros(nzs_out, out_layouts),
-        donated_invars=_filter_zeros(nzs, donated_invars) + res_donated,
+        donated_invars=res_donated + _filter_zeros(nzs, donated_invars),
         ctx_mesh=ctx_mesh,
         name=name,
         keep_unused=keep_unused,
@@ -2987,7 +2950,6 @@ def _reshard_hlo_lowering(ctx, x_node, *, dst_sharding):
 mlir.register_lowering(reshard_p, _reshard_hlo_lowering)
 
 def _reshard_batcher(axis_data, vals_in, dims_in, dst_sharding):
-  assert axis_data.spmd_name is None
   x, = vals_in
   d, = dims_in
   vmapped_dst_sharding = batching.get_sharding_for_vmap(
@@ -3045,8 +3007,14 @@ def _get_new_mesh(axes: str | tuple[str, ...] | None,
           ' with your use case')
   return mesh_to_use.update_axis_types({a: axis_type for a in axes})
 
-def auto_axes(fun, *, axes: str | tuple[str, ...] | None = None,
+def auto_axes(f=None, /, *, axes: str | tuple[str, ...] | None = None,
               out_sharding=None):
+  kwargs = dict(axes=axes, out_sharding=out_sharding)
+  if f is None:
+    return lambda g: _auto_axes(g, **kwargs)
+  return _auto_axes(f, **kwargs)
+
+def _auto_axes(fun, *, axes, out_sharding):
   def decorator(*args, **kwargs):
     if out_sharding is None:
       if "out_sharding" in kwargs:
@@ -3066,6 +3034,7 @@ def auto_axes(fun, *, axes: str | tuple[str, ...] | None = None,
     return mesh_cast(out, _out_sharding)
   return decorator
 
+
 @contextlib.contextmanager
 def use_auto_axes(*axes):
   new_mesh = _get_new_mesh(axes, mesh_lib.AxisType.Auto, 'use_auto_axes')
@@ -3073,8 +3042,14 @@ def use_auto_axes(*axes):
     yield
 
 
-def explicit_axes(fun, *, axes: str | tuple[str, ...] | None = None,
+def explicit_axes(f=None, /, *, axes: str | tuple[str, ...] | None = None,
                   in_sharding=None):
+  kwargs = dict(axes=axes, in_sharding=in_sharding)
+  if f is None:
+    return lambda g: _explicit_axes(g, **kwargs)
+  return _explicit_axes(f, **kwargs)
+
+def _explicit_axes(fun, *, axes, in_sharding):
   def decorator(*args, **kwargs):
     if in_sharding is None:
       if "in_sharding" in kwargs:
@@ -3092,6 +3067,7 @@ def explicit_axes(fun, *, axes: str | tuple[str, ...] | None = None,
         core.get_aval(o).sharding.spec, mesh_lib.get_abstract_mesh()), out)
     return mesh_cast(out, out_specs)
   return decorator
+
 
 @contextlib.contextmanager
 def use_explicit_axes(*axes):

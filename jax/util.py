@@ -16,7 +16,6 @@
 # See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 import jax._src.deprecations
-import jax._src.util
 
 
 _deprecations = {
@@ -104,8 +103,7 @@ _deprecations = {
 import typing as _typing
 
 if _typing.TYPE_CHECKING:
-  # TODO(jakevdp): migrate downstream users and remove this.
-  HashableFunction = jax._src.util.HashableFunction
+  pass
 else:
   __getattr__ = jax._src.deprecations.deprecation_getattr(
       __name__, _deprecations

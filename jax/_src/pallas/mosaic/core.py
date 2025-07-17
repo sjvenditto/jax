@@ -58,13 +58,17 @@ class KernelType(enum.Enum):
 
 class GridDimensionSemantics(enum.Enum):
   PARALLEL = "parallel"
+  CORE_PARALLEL = "core_parallel"
   ARBITRARY = "arbitrary"
 
 PARALLEL = GridDimensionSemantics.PARALLEL
+CORE_PARALLEL = GridDimensionSemantics.CORE_PARALLEL
 ARBITRARY = GridDimensionSemantics.ARBITRARY
 
 
-DimensionSemantics = Literal["parallel", "arbitrary"] | GridDimensionSemantics
+DimensionSemantics = (
+    Literal["parallel", "core_parallel", "arbitrary"] | GridDimensionSemantics
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,7 +147,6 @@ class CompilerParams(pallas_core.CompilerParams):
   # Replace is a method, not a field.
   replace = dataclasses.replace
 
-
 class MemorySpace(enum.Enum):
   ANY = "any"  # TODO(b/368401328): Remove this and just use pl.ANY.
   VMEM = "vmem"
@@ -151,6 +154,7 @@ class MemorySpace(enum.Enum):
   CMEM = "cmem"
   SEMAPHORE = "semaphore_mem"
   HBM = "hbm"
+  HOST = "host"
 
   def __str__(self) -> str:
     return self.value
@@ -293,11 +297,11 @@ def _tensorcore_mesh_discharge_rule(
   if num_cores > 1:
     # Since each core will have its own VMEM, we currently disallow VMEM inputs
     # and outputs since we do not know how they are sharded across cores.
-    if any(pallas_core.get_memory_space_aval(aval) == MemorySpace.VMEM
+    if any(pallas_core.get_memory_space_aval(aval) in {MemorySpace.VMEM, MemorySpace.SMEM}
             for aval in in_avals):
       raise NotImplementedError(
-          "TensorCoreMesh does not support VMEM inputs/outputs when there are"
-          " >1 cores. Use HBM or ANY instead."
+          "TensorCoreMesh does not support VMEM/SMEM inputs/outputs when there"
+          " are >1 cores. Use HBM or ANY instead."
       )
   return pallas_core.default_mesh_discharge_rule(
       in_avals,

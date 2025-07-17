@@ -1869,19 +1869,19 @@ class APITest(jtu.JaxTestCase):
     x2 = api.device_get(dx)
     self.assertNotIsInstance(x2, jax.Array)
     self.assertIsInstance(x2, np.ndarray)
-    assert np.all(x == x2)
+    self.assertArraysEqual(x2, x)
 
     y = [x, (2 * x, 3 * x)]
     dy = api.device_put(y)
     y2 = api.device_get(dy)
     self.assertIsInstance(y2, list)
     self.assertIsInstance(y2[0], np.ndarray)
-    assert np.all(y2[0] == x)
+    self.assertArraysEqual(y2[0], x)
     self.assertIsInstance(y2[1], tuple)
     self.assertIsInstance(y2[1][0], np.ndarray)
-    assert np.all(y2[1][0] == 2 * x)
+    self.assertArraysEqual(y2[1][0], 2 * x)
     self.assertIsInstance(y2[1][1], np.ndarray)
-    assert np.all(y2[1][1] == 3 * x)
+    self.assertArraysEqual(y2[1][1], 3 * x)
 
   def test_device_put_sharding(self):
     mesh = jax.sharding.Mesh(jax.devices(), ('x',))
@@ -2153,7 +2153,7 @@ class APITest(jtu.JaxTestCase):
     y2 = api.device_get(y)
     self.assertIsInstance(y2, list)
     self.assertIsInstance(y2[0], np.ndarray)
-    assert np.all(y2[0] == x)
+    self.assertArraysEqual(y2[0], x)
     self.assertIsInstance(y2[1], int)
     self.assertEqual(y2[1], 2)
 
@@ -2234,11 +2234,11 @@ class APITest(jtu.JaxTestCase):
     x = R(3)
 
     f = lambda x: jnp.dot(A, x)
-    assert np.allclose(jacfwd(f)(x), A)
-    assert np.allclose(jacrev(f)(x), A)
+    self.assertAllClose(jacfwd(f)(x), A)
+    self.assertAllClose(jacrev(f)(x), A)
 
     f = lambda x: jnp.tanh(jnp.dot(A, x))
-    assert np.allclose(jacfwd(f)(x), jacrev(f)(x))
+    self.assertAllClose(jacfwd(f)(x), jacrev(f)(x))
 
   @jax.default_matmul_precision("float32")
   def test_hessian(self):
@@ -2247,7 +2247,7 @@ class APITest(jtu.JaxTestCase):
     x = R(4)
 
     f = lambda x: jnp.dot(x, jnp.dot(A, x))
-    assert np.allclose(hessian(f)(x), A + A.T)
+    self.assertAllClose(hessian(f)(x), A + A.T)
 
   @jax.default_matmul_precision("float32")
   def test_hessian_holomorphic(self):
@@ -2256,7 +2256,8 @@ class APITest(jtu.JaxTestCase):
     x = R(4).astype('complex64') * (1 + 2j)
 
     f = lambda x: jnp.dot(x, jnp.dot(A.astype(x.dtype), x))
-    assert np.allclose(hessian(f, holomorphic=True)(x), A + A.T)
+    self.assertAllClose(
+        hessian(f, holomorphic=True)(x), (A + A.T).astype(x.dtype))
 
   @jax.default_matmul_precision("float32")
   def test_hessian_aux(self):
@@ -2266,17 +2267,17 @@ class APITest(jtu.JaxTestCase):
 
     f = lambda x: (jnp.dot(x, jnp.dot(A, x)), x)
     h, aux = hessian(f, has_aux=True)(x)
-    assert np.allclose(h, A + A.T)
-    assert np.allclose(aux, x)
+    self.assertAllClose(h, A + A.T)
+    self.assertAllClose(aux, x)
 
   def test_std_basis(self):
     basis = api._std_basis(jnp.zeros(3))
     assert getattr(basis, "shape", None) == (3, 3)
-    assert np.allclose(basis, np.eye(3))
+    self.assertAllClose(basis, np.eye(3))
 
     basis = api._std_basis(jnp.zeros((3, 3)))
     assert getattr(basis, "shape", None) == (9, 3, 3)
-    assert np.allclose(basis, np.eye(9).reshape(9, 3, 3))
+    self.assertAllClose(basis, np.eye(9).reshape(9, 3, 3))
 
     basis = api._std_basis([0., (jnp.zeros(3), jnp.zeros((3, 4)))])
     assert isinstance(basis, list) and len(basis) == 2
@@ -4354,9 +4355,6 @@ class APITest(jtu.JaxTestCase):
     # from https://github.com/jax-ml/jax/issues/7613
     import numpy.random as npr
 
-    def sigmoid(x):
-      return 1. / (1. + jnp.exp(-x))
-
     x = jnp.ones((1, 50))
     A = jnp.array(npr.randn(50, 50), dtype=x.dtype)
 
@@ -5107,11 +5105,26 @@ class APITest(jtu.JaxTestCase):
     # long time. This test checks we don't *unintentionally* break it.
     c = np.ones(3)
 
+    def find_constants(jaxpr: core.ClosedJaxpr):
+      for j in it.chain([jaxpr], core.subjaxprs(jaxpr)):
+        for eq in j.eqns:
+          for inv in eq.invars:
+            if isinstance(inv, core.Literal) and np.shape(inv.val):
+              yield inv.val
+
+    def uniq(lst):
+      return {id(v): v for v in lst}.values()
+
     @jax.make_jaxpr
     def f():
       return c, jnp.sum(c), c, jnp.sum(c)
 
-    self.assertLen(f().consts, 1)
+    if config.use_simplified_jaxpr_constants.value:
+      consts = uniq(find_constants(f()))
+    else:
+      consts = f().consts
+
+    self.assertLen(consts, 1)
 
     d = np.zeros(3)
 
@@ -5120,7 +5133,11 @@ class APITest(jtu.JaxTestCase):
       return jax.lax.cond(True,
                           lambda: (c, jnp.sum(c), c),
                           lambda: (c, jnp.sum(d), d))
-    self.assertLen(g().consts, 2)
+    if config.use_simplified_jaxpr_constants.value:
+      consts = uniq(find_constants(g()))
+    else:
+      consts = g().consts
+    self.assertLen(consts, 2)
 
   # TODO(mattjj,dougalm): this test was flakey on CI; figure out how to enable?
   # @jtu.run_on_devices('cpu')
@@ -6164,7 +6181,10 @@ class RematTest(jtu.JaxTestCase):
     res = saved_residuals(f, (2., 3.), y=4.)
     self.assertLen(res, 6)
     self.assertEqual(res[0][0].shape, (1,))
-    self.assertEqual(res[0][1], "from a constant")
+    if config.use_simplified_jaxpr_constants.value:
+      self.assertEqual(res[0][1], "from a literal")
+    else:
+      self.assertEqual(res[0][1], "from a constant")
     self.assertEqual(res[1][0].shape, ())
     self.assertEqual(res[1][1], "from the argument x[0]")
     self.assertEqual(res[2][0].shape, ())
@@ -6183,18 +6203,22 @@ class RematTest(jtu.JaxTestCase):
       return z * ((x1 * x2) * y) * np.array([3.])
 
     res = saved_residuals(f, (2., 3.), y=4.)
-    self.assertLen(res, 6)
-    self.assertEqual(res[0][0].shape, (1,))
-    self.assertEqual(res[0][1], "from a constant")
+    if config.use_simplified_jaxpr_constants.value:
+      base_res_idx = 0
+    else:
+      self.assertEqual(res[0][1], "from a constant")
+      self.assertEqual(res[0][0].shape, (1,))
+      res.pop(0)
+    self.assertLen(res, 5)
+    self.assertEqual(res[0][0].shape, ())
+    self.assertEqual(res[0][1], "from the argument x[0]")
     self.assertEqual(res[1][0].shape, ())
-    self.assertEqual(res[1][1], "from the argument x[0]")
+    self.assertEqual(res[1][1], "from the argument x[1]")
     self.assertEqual(res[2][0].shape, ())
-    self.assertEqual(res[2][1], "from the argument x[1]")
+    self.assertEqual(res[2][1], "from the argument y")
     self.assertEqual(res[3][0].shape, ())
-    self.assertEqual(res[3][1], "from the argument y")
+    self.assertStartsWith(res[3][1], "output of jitted function 'f'")
     self.assertEqual(res[4][0].shape, ())
-    self.assertStartsWith(res[4][1], "output of jitted function 'f'")
-    self.assertEqual(res[5][0].shape, ())
 
   @parameterized.named_parameters(
       {"testcase_name": f"{suffix}", "remat": remat}
@@ -6897,7 +6921,19 @@ class JaxprTest(jtu.JaxTestCase):
       return (x, 1., np.zeros(1, dtype=jnp.float32))
 
     dtype = "f64" if config.enable_x64.value else "f32"
-    expected = f"{{ lambda a:f32[1]; b:f32[]. let  in (b, 1.0:{dtype}[], a) }}"
+    if config.use_simplified_jaxpr_constants.value:
+      expected = f"{{ lambda ; a:f32[]. let  in (a, 1.0:{dtype}[], [0.]:f32[1]) }}"
+    else:
+      expected = f"{{ lambda a:f32[1]; b:f32[]. let  in (b, 1.0:{dtype}[], a) }}"
+    jaxpr = api.make_jaxpr(fun)(jnp.float32(0.))
+    self.assertMultiLineStrippedEqual(expected, str(jaxpr))
+
+  @config.use_simplified_jaxpr_constants(True)
+  def test_non_scalar_const(self):
+    def fun(x):
+      return (x, np.zeros(3, dtype=jnp.float32))
+
+    expected = "{ lambda ; a:f32[]. let  in (a, [...]:f32[3]) }"
     jaxpr = api.make_jaxpr(fun)(jnp.float32(0.))
     self.assertMultiLineStrippedEqual(expected, str(jaxpr))
 

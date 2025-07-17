@@ -592,6 +592,7 @@ class OpsTest(PallasBaseTest):
 
   @parameterized.product(from_dtype=_DTYPES_32BIT, to_dtype=_DTYPES)
   @hp.given(hps.data())
+  @hp.settings(suppress_health_check=[hp.HealthCheck.too_slow])  # ASAN is slow
   def test_cast_from_32bit(self, from_dtype, to_dtype, data):
     sut_is_mosaic_gpu = jtu.test_device_matches(["gpu"]) and use_mosaic_gpu
     if to_dtype in {"float8_e4m3b11fnuz", "float8_e5m2", "float8_e4m3fn"}:
@@ -738,7 +739,7 @@ class OpsTest(PallasBaseTest):
           2025, 5, 15
       ):
         self.skipTest("Test requires libtpu from 2025/5/15 or later")
-    if from_dtype == "int2" and to_dtype == "bool":
+    if from_dtype in ("uint2", "int2") and to_dtype == "bool":
       self.skipTest(
           "TODO(b/343490729): XLA compare(s2, s2) yields wrong results"
       )
@@ -1420,6 +1421,86 @@ class OpsTest(PallasBaseTest):
     np.testing.assert_array_equal(
         out,
         jax.lax.dot_general(x, y, dimension_numbers=(([2], [1]), ([0], [0]))),
+    )
+
+  @parameterized.product(
+      batch_size=(None, 1, 2),
+      # dims_numbers is without batch dims
+      shapes_and_dims_numbers=(
+          # leading lhs non contracting dims.
+          ((8, 8, 256), (256, 128), ([2], [0])),
+          ((3, 4, 128), (256, 128), ([2], [1])),
+          # trailing lhs non contracting dims.
+          ((256, 8, 128), (256, 128), ([0], [0])),
+          ((128, 8, 128), (256, 128), ([0], [1])),
+          # leading rhs non contracting dims.
+          ((8, 128), (8, 128, 128), ([1], [2])),
+          ((128, 8), (8, 128, 128), ([0], [2])),
+          # trailing rhs non contracting dims.
+          ((8, 128), (128, 8, 128), ([1], [0])),
+          ((128, 8), (128, 8, 128), ([0], [0])),
+          # leading lhs and rhs non contracting dims.
+          ((8, 8, 128), (8, 128, 128), ([2], [2])),
+          # leading lhs and trailing rhs non contracting dims.
+          ((8, 8, 128), (128, 8, 128), ([2], [0])),
+          # trailing lhs and leading rhs non contracting dims.
+          ((32, 8, 128), (8, 128, 32), ([0], [2])),
+          # trailing lhs and trailing rhs non contracting dims.
+          ((8, 8, 128), (8, 8, 128), ([0], [0])),
+      ),
+  )
+  def test_dot_general_multiple_non_contracting_dims(
+      self, batch_size, shapes_and_dims_numbers
+  ):
+    if jtu.test_device_matches(["gpu"]):
+      self.skipTest("TPU only test")
+
+    if jtu.test_device_matches(["tpu"]) and not jtu.if_cloud_tpu_at_least(
+        2025, 7, 19
+    ):
+      self.skipTest("Requires libtpu built after 2025-07-19")
+
+    x_shape, y_shape, dims_numbers = shapes_and_dims_numbers
+    if batch_size is not None:
+      x_shape = (batch_size,) + x_shape
+      y_shape = (batch_size,) + y_shape
+
+      # Batch size is always the first dimension so we need to offset
+      # dims_numbers by 1.
+      def offset_by_one(x):
+        return [a + 1 for a in x]
+
+      dims_numbers = (
+          (offset_by_one(dims_numbers[0]), offset_by_one(dims_numbers[1])),
+          ([0], [0]),
+      )
+    else:
+      dims_numbers = (
+          (dims_numbers[0], dims_numbers[1]),
+          ([], []),
+      )
+
+    k1, k2 = random.split(jax.random.key(0))
+    x = jax.random.normal(k1, x_shape, dtype=jnp.float32)
+    y = jax.random.normal(k2, y_shape, dtype=jnp.float32)
+
+    # Just infer shape from jax.
+    expected = jax.lax.dot_general(x, y, dimension_numbers=dims_numbers)
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+    )
+    def kernel(x_ref, y_ref, out_ref):
+      out_ref[...] = jax.lax.dot_general(
+          x_ref[...],
+          y_ref[...],
+          dimension_numbers=dims_numbers,
+      )
+
+    np.testing.assert_allclose(
+        kernel(x, y),
+        expected,
     )
 
   @parameterized.parameters(
@@ -2634,6 +2715,66 @@ class OpsTest(PallasBaseTest):
     )(x)
     expected = jnp.swapaxes(x, 0, 1)
     np.testing.assert_array_equal(out, expected)
+
+  @hp.given(batch_size=hps.integers(1, 16))
+  def test_8bit_gather(self, batch_size):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Not supported on this hardware")
+    if jtu.get_tpu_version() < 6:
+      self.skipTest("Requires TPUv6 or newer")
+    if not jtu.if_cloud_tpu_at_least(2025, 9, 22):
+      self.skipTest("Requires libtpu built after 2025-9-22")
+
+    dtype = jnp.int8
+    xspec = pl.BlockSpec((32, 128), lambda i: (i, 0))
+    lspec = pl.BlockSpec((32, 128), lambda i: (0, 0))
+
+    data = jax.random.randint(
+        key=jax.random.key(1234),
+        shape=(32 * batch_size, 128),
+        minval=0,
+        maxval=32,
+        dtype=jnp.int8,
+    )
+    lut = jax.random.randint(
+        key=jax.random.key(1234),
+        shape=(32, 128),
+        minval=-128,
+        maxval=127,
+        dtype=jnp.int8,
+    )
+
+    def kernel(data_ref, lut_ref, output_ref):
+      data_chunk = data_ref[...]
+      lut_chunk = lut_ref[...]
+      data_chunk = data_chunk.reshape((32, 128, 1))
+      output = lax.gather(
+          lut_chunk,
+          data_chunk,
+          dimension_numbers=lax.GatherDimensionNumbers(
+              offset_dims=(),
+              start_index_map=(0,),
+              operand_batching_dims=(1,),
+              start_indices_batching_dims=(1,),
+              collapsed_slice_dims=(0,)
+          ),
+          slice_sizes=(1, 1),
+          mode="promise_in_bounds",
+      )
+      output_ref[...] = output
+
+    deq_call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(data.shape, dtype),
+        grid=(batch_size,),
+        out_specs=xspec,
+        in_specs=[xspec, lspec],
+    )
+    result = deq_call(data, lut)
+    expected = jnp.take_along_axis(
+        lut, data, axis=0, mode="promise_in_bounds"
+    )
+    np.testing.assert_array_equal(result, expected)
 
 
 class OpsInterpretTest(OpsTest):

@@ -57,7 +57,13 @@ class MostReplicated:
     assert len(self.expressions) >= 1
 
 
-Expression = Variable | Constant | LeastReplicated | MostReplicated
+@dataclasses.dataclass(frozen=True)
+class Reduce:
+  expression: Expression
+  axes: tuple[int, ...]
+
+
+Expression = Variable | Constant | LeastReplicated | MostReplicated | Reduce
 
 
 def reduce_replicated_expression(
@@ -124,8 +130,126 @@ def reduce_expression(
       return reduce_replicated_expression(
           expr, assignments, layouts_lib.meet_layouts
       )
+    case Reduce(expression=expr, axes=axes):
+      reduced_expr = reduce_expression(expr, assignments)
+      match reduced_expr:
+        case Unsatisfiable():
+          return Unsatisfiable()
+        case Constant(value=layout) if isinstance(layout, fa.TiledLayout):
+          return Constant(layout.reduce(axes))
+        case Constant():
+          # Explicitly raise an error here as opposed to simply failing to
+          # simplify, so that we get a clear signal if we ever need to implement
+          # this.
+          raise NotImplementedError(
+              "Reduction of non-tiled layouts is not implemented yet."
+          )
+        case _:
+          return Reduce(expression=reduced_expr, axes=axes)
     case _:
       assert_never(expr)
+
+
+_SUPPORTED_TILED_RELAYOUTS = frozenset([
+    # Transposed layouts.
+    (fa.WGMMA_LAYOUT, fa.WGMMA_TRANSPOSED_LAYOUT),
+    (fa.TCGEN05_LAYOUT, fa.TCGEN05_TRANSPOSED_LAYOUT),
+    # "Conversion-optimized" layouts.
+    (fa.WGMMA_LAYOUT_UPCAST_2X, fa.WGMMA_LAYOUT),
+    (fa.WGMMA_LAYOUT_UPCAST_4X, fa.WGMMA_LAYOUT_UPCAST_2X),
+    (fa.WGMMA_LAYOUT_UPCAST_4X, fa.WGMMA_LAYOUT),
+])
+
+
+@dataclasses.dataclass(frozen=True)
+class Relayout:
+  """States that `source` must be relayout-able to `target`.
+
+  Relayout-ability here is not defined as a fundamental property of layouts, but
+  rather a reflection of our implementation. For instance, when evaluating this
+  constraint, we will return `False` systematically if a relayout exists but we
+  do not ever plan to support it.
+
+  Modeling this constraint this way is helpful, in order to allow pruning
+  inefficient solutions when attempting to solve an equation system.
+  """
+
+  source: Expression
+  target: Expression
+
+  def holds(self) -> bool | None:
+    """Returns whether the relayout constraint holds.
+
+    Returns `None` if the constraint can't be checked.
+    """
+    source = self.source
+    target = self.target
+
+    # Fast path for syntactically identical expressions.
+    if source == target:
+      return True
+
+    if not isinstance(source, Constant) or not isinstance(target, Constant):
+      return None
+
+    source_layout, target_layout = source.value, target.value
+    match source_layout, target_layout:
+      case fa.WGSplatFragLayout(), fa.WGStridedFragLayout():
+        return source_layout.shape == target_layout.shape
+      case fa.WGSplatFragLayout(), fa.TiledLayout():
+        return layouts_lib.splat_is_compatible_with_tiled(
+            source_layout, target_layout
+        )
+      case fa.TiledLayout(), fa.TiledLayout():
+        return (source_layout, target_layout) in _SUPPORTED_TILED_RELAYOUTS
+      case _:
+        return False
+
+
+@dataclasses.dataclass(frozen=True)
+class Distinct:
+  """States that `lhs != rhs`."""
+  lhs: Expression
+  rhs: Expression
+
+  def holds(self) -> bool | None:
+    """Whether the distinctiveness constraint holds.
+
+    Returns `None` if the constraint can't be checked.
+    """
+    if self.lhs == self.rhs:
+      return False
+    if isinstance(self.lhs, Constant) and isinstance(self.rhs, Constant):
+      return True
+    return None
+
+
+Constraint = Relayout | Distinct
+
+
+def reduce_constraint(
+    constraint: Constraint, assignments: dict[Variable, Constant]
+) -> Constraint | Tautological | Unsatisfiable:
+  """Reduces a constraint."""
+  match constraint:
+    case Relayout(source=lhs, target=rhs):
+      ...
+    case Distinct(lhs=lhs, rhs=rhs):
+      ...
+    case _ as never:
+      assert_never(never)
+
+  lhs_red = reduce_expression(lhs, assignments)
+  rhs_red = reduce_expression(rhs, assignments)
+
+  if isinstance(lhs_red, Unsatisfiable) or isinstance(rhs_red, Unsatisfiable):
+    return Unsatisfiable()
+
+  new_constraint = type(constraint)(lhs_red, rhs_red)
+  constraint_holds = new_constraint.holds()
+  if constraint_holds is None:
+    return new_constraint
+  return Tautological() if constraint_holds else Unsatisfiable()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,7 +263,7 @@ class Equation:
 
 def reduce_equation(
     eq: Equation, assignments: dict[Variable, Constant]
-) -> Solution | Unsatisfiable:
+) -> Solution:
   """Reduces an equation.
 
   Args:
@@ -180,11 +304,15 @@ class EquationSystem:
   Assignments assign constant values to variables in the system (bound
   variables). Equations describe relationships between variables, and can be
   used to determine assignments for unknown (free) variables.
+
+  Constraints are used to check predicates that must hold for the assignments to
+  be valid.
   """
   assignments: dict[Variable, Constant] = dataclasses.field(
       default_factory=dict
   )
   equations: list[Equation] = dataclasses.field(default_factory=list)
+  constraints: list[Constraint] = dataclasses.field(default_factory=list)
 
   def unknowns(self) -> list[Variable]:
     """Returns the list of free variables in the system."""
@@ -204,11 +332,23 @@ class EquationSystem:
         case LeastReplicated(expressions=expressions):
           for e in expressions:
             extract_variables(e)
+        case Reduce(expression=e):
+          extract_variables(e)
         case _:
           assert_never(expr)
     for equation in self.equations:
       extract_variables(equation.lhs)
       extract_variables(equation.rhs)
+    for constraint in self.constraints:
+      match constraint:
+        case Relayout(source=source, target=target):
+          extract_variables(source)
+          extract_variables(target)
+        case Distinct(lhs=lhs, rhs=rhs):
+          extract_variables(lhs)
+          extract_variables(rhs)
+        case _ as never:
+          assert_never(never)
     return free_variables
 
   def __and__(self, other: EquationSystem) -> EquationSystem | Unsatisfiable:
@@ -218,6 +358,7 @@ class EquationSystem:
     return EquationSystem(
         assignments=self.assignments | other.assignments,
         equations=self.equations + other.equations,
+        constraints=self.constraints + other.constraints,
     )
 
 
@@ -279,10 +420,23 @@ def _reduce_system_once(
       case _ as never:
         assert_never(never)
 
+  assignments |= equation_system.assignments
+  constraints: list[Constraint] = []
+  for constraint in equation_system.constraints:
+    match reduce_constraint(constraint, assignments):
+      case Unsatisfiable():
+        return Unsatisfiable()
+      case Tautological():
+        changed = True
+      case _ as new_constraint:
+        changed |= new_constraint != constraint
+        constraints.append(new_constraint)
+
   if changed:
     return EquationSystem(
         assignments=assignments | equation_system.assignments,
         equations=equations,
+        constraints=constraints,
     )
   return None
 
