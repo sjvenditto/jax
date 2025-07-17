@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Any
 
 import jax
@@ -180,11 +181,22 @@ class AsyncCopyDescriptor:
   src_sem_transforms: tuple[Transform, ...] | None
   device_id: MultiDimDeviceId | IntDeviceId | None
   device_id_type: primitives.DeviceIdType = primitives.DeviceIdType.MESH
+  _used: bool = dataclasses.field(
+      default=False, init=False, compare=False, hash=False
+  )
 
   def __post_init__(self):
     if (self.src_sem is None) ^ (self.device_id is None):
       raise ValueError("Either both or neither `src_sem` and `device_id` "
                        "can be set.")
+
+  def __del__(self):
+    if not self._used:
+      # Exceptions in ``__del__`` are ignored, so logging is our only option.
+      logging.error(
+          "AsyncCopyDescriptor was not used."
+          " Did you mean to call `start` or `wait` on it?"
+      )
 
   @property
   def is_remote(self):
@@ -217,6 +229,7 @@ class AsyncCopyDescriptor:
       ))
 
   def start(self, priority: int = 0):
+    self._used = True
     flat_args, tree = self._get_args_and_tree()
     dma_start_p.bind(
         *flat_args,
@@ -231,12 +244,14 @@ class AsyncCopyDescriptor:
     self.wait_recv()
 
   def wait_recv(self):
+    self._used = True
     flat_args, tree = self._get_args_and_tree()
     dma_wait_p.bind(
         *flat_args, tree=tree, device_id_type=self.device_id_type
     )
 
   def wait_send(self):
+    self._used = True
     if not self.is_remote:
       raise ValueError("Cannot `wait_send` on a local copy.")
     # We swap src and dst since by default dma_wait_p waits on the dst_sem
@@ -246,6 +261,29 @@ class AsyncCopyDescriptor:
     dma_wait_p.bind(
         *flat_args, tree=tree, device_id_type=self.device_id_type
     )
+
+
+def _get_dma_effects(
+    src_transforms_avals,
+    dst_transforms_avals,
+    dst_sem_transforms_avals,
+    src_sem_aval,
+):
+  n_src_transforms = len(tree_util.tree_leaves(src_transforms_avals))
+  n_dst_transforms = len(tree_util.tree_leaves(dst_transforms_avals))
+  n_dst_sem_transforms = len(tree_util.tree_leaves(dst_sem_transforms_avals))
+  dst_sem_index = 1 + n_src_transforms + 1 + n_dst_transforms
+  effs = {
+      state.ReadEffect(0),  # Read from src ref
+      state.WriteEffect(n_src_transforms + 1),  # Write to dst ref
+      state.WriteEffect(dst_sem_index),  # Write to dst sem
+  }
+  if src_sem_aval is not None:
+    src_sem_index = (
+        1 + n_src_transforms + 1 + n_dst_transforms + 1 + n_dst_sem_transforms
+    )
+    effs.add(state.WriteEffect(src_sem_index))
+  return effs
 
 
 dma_start_p = jax_core.Primitive('dma_start')
@@ -281,8 +319,12 @@ def _dma_start_abstract_eval(*args, tree, device_id_type, priority):
       raise ValueError(
           f"Cannot signal on a non-()-shaped semaphore: {src_sem_shape}"
       )
-  n_src_transforms = len(tree_util.tree_leaves(src_transforms_avals))
-  return [], {state.ReadEffect(0), state.WriteEffect(n_src_transforms + 1)}
+  return [], _get_dma_effects(
+      src_transforms_avals,
+      dst_transforms_avals,
+      dst_sem_transforms_avals,
+      src_sem_aval,
+  )
 
 def _dma_start_pp_eqn(eqn: jax_core.JaxprEqn,
                       context: jax_core.JaxprPpContext,
@@ -498,10 +540,26 @@ state_discharge.register_partial_discharge_rule(dma_start_p)(dma_start_partial_d
 dma_wait_p = jax_core.Primitive('dma_wait')
 dma_wait_p.multiple_results = True
 
-@dma_wait_p.def_abstract_eval
+@dma_wait_p.def_effectful_abstract_eval
 def _dma_wait_abstract_eval(*args, tree, device_id_type):
-  del args, tree, device_id_type
-  return []
+  del device_id_type
+  (
+      src_ref_aval,
+      src_transforms_avals,
+      dst_ref_aval,
+      dst_transforms_avals,
+      dst_sem_aval,
+      dst_sem_transforms_avals,
+      src_sem_aval,
+      src_sem_transforms_avals,
+      device_id_aval,
+  ) = tree_util.tree_unflatten(tree, args)
+  return [], _get_dma_effects(
+      src_transforms_avals,
+      dst_transforms_avals,
+      dst_sem_transforms_avals,
+      src_sem_aval,
+  )
 
 def _dma_wait_pp_eqn(eqn: jax_core.JaxprEqn,
                      context: jax_core.JaxprPpContext,
@@ -817,9 +875,13 @@ def with_memory_space_constraint(
   """
   if memory_space in {tpu_core.MemorySpace.ANY, pl_core.MemorySpace.ANY}:
     return x
-  if memory_space not in {tpu_core.MemorySpace.HBM, tpu_core.MemorySpace.VMEM}:
+  if memory_space not in {
+      tpu_core.MemorySpace.HBM,
+      tpu_core.MemorySpace.VMEM,
+      tpu_core.MemorySpace.SMEM,
+  }:
     raise NotImplementedError(
-        "with_memory_space_constraint only supports HBM and VMEM."
+        "with_memory_space_constraint only supports HBM, VMEM and SMEM."
     )
   return pl_core.with_memory_space_constraint_p.bind(
       x, memory_space=memory_space)

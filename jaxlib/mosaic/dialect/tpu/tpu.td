@@ -163,7 +163,8 @@ def TPU_MemorySpace : I32EnumAttr<"MemorySpace", "Memory space", [
   I32EnumAttrCase<"kHbm", 2, "hbm">,
   I32EnumAttrCase<"kCmem", 3, "cmem">,
   I32EnumAttrCase<"kSemaphoreMem", 4, "semaphore_mem">,
-  I32EnumAttrCase<"kVmemShared", 5, "vmem_shared">
+  I32EnumAttrCase<"kVmemShared", 5, "vmem_shared">,
+  I32EnumAttrCase<"kHost", 6, "host">
 ]> {
     let genSpecializedAttr = 0;
     let cppNamespace = "::mlir::tpu";
@@ -228,6 +229,11 @@ def TPU_LoadOp : TPU_Op<"load", [DefaultMemRead]> {
   let results = (outs TPU_Vreg:$result);
   let assemblyFormat = [{
     $base `[` $indices `]` `sublanes` $sublane_mask (`sublane_stride` $sublane_stride^)? attr-dict `:` type($base) `,` type($result)
+  }];
+  let description = [{
+    Similar to `vector::LoadOp` but with `sublane_mask` and `sublane_stride`.
+    When `indices` are negative, it means loading from negative offset
+    of `base` address.
   }];
 }
 

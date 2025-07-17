@@ -707,13 +707,12 @@ LogicalResult elementwise_op_rule(RewriteContext &ctx, Operation &op,
         "Not implemented: Null layout / non-vector operand in elementwise "
         "operation");
   }
-  const auto out_ty = cast<VectorType>(op.getResult(0).getType());
-  const VectorLayout &layout_out = *layouts_out.front();
-  if (!llvm::all_of(layouts_in, [&](const Layout &l) {
-        return l->generalizes(layout_out, out_ty.getShape(), ctx.target_shape);
-      })) {
+  const auto vty = cast<VectorType>(op.getResult(0).getType());
+  const VectorLayout &layout = *layouts_out.front();
+  if (!llvm::all_of(layouts_in,
+                    [&](const Layout &l) { return layout == *l; })) {
     return op.emitOpError(
-        "Not implemented: Incompatible layouts in elementwise operation");
+        "Not implemented: Different layouts in elementwise operation");
   }
   const unsigned num_operands = op.getNumOperands();
   SmallVector<xla::Array<Value>> in_vreg_arrays;
@@ -728,39 +727,20 @@ LogicalResult elementwise_op_rule(RewriteContext &ctx, Operation &op,
   }
 
   const VectorType out_vreg_ty = getNativeVregOrVmaskType(
-      out_ty.getElementType(), layout_out.bitwidth(), ctx.target_shape);
+      vty.getElementType(), layout.bitwidth(), ctx.target_shape);
 
   NamedAttrList attributes(op.getAttrDictionary());
   attributes.erase("in_layout");
   attributes.erase("out_layout");
 
-  // Note that we have to broadcast to handle replicate dimensions.
-  SmallVector<int64_t> broadcasted_shape(
-      toArrayRef(in_vreg_arrays[0].dimensions()));
-  for (size_t i = 1; i < num_operands; ++i) {
-    SmallVector<int64_t> new_broadcasted_shape;
-    TPU_ASSERT_OP(OpTrait::util::getBroadcastedShape(
-        broadcasted_shape, toArrayRef(in_vreg_arrays[i].dimensions()),
-        new_broadcasted_shape));
-    broadcasted_shape = std::move(new_broadcasted_shape);
-  }
-  TPU_ASSERT_OP(broadcasted_shape ==
-                layout_out.tileArrayShape(out_ty.getShape(), ctx.target_shape));
-
   // TODO(tlongeri): Can we avoid initializing the array before filling values?
-  xla::Array<Value> out_vreg_array(broadcasted_shape);
+  xla::Array<Value> out_vreg_array(
+      layout.tileArrayShape(vty.getShape(), ctx.target_shape));
   out_vreg_array.Each([&](absl::Span<const int64_t> idx, Value *out_vreg) {
     SmallVector<Value> operands(num_operands);
 
     for (unsigned i = 0; i < num_operands; ++i) {
-      // Handle indices for broadcasted dimensions
-      SmallVector<int64_t> operand_idx(toArrayRef(idx));
-      for (unsigned j = 0; j < idx.size(); ++j) {
-        if (in_vreg_arrays[i].dim(j) == 1) {
-          operand_idx[j] = 0;
-        }
-      }
-      operands[i] = in_vreg_arrays[i](operand_idx);
+      operands[i] = in_vreg_arrays[i](idx);
     }
     Operation *vreg_op =
         builder.create(op.getLoc(), op.getName().getIdentifier(), operands,
@@ -769,7 +749,7 @@ LogicalResult elementwise_op_rule(RewriteContext &ctx, Operation &op,
     CHECK_EQ(vreg_op->getNumResults(), 1);
     *out_vreg = vreg_op->getResult(0);
   });
-  op.replaceAllUsesWith(assemble(builder, out_ty, layout_out,
+  op.replaceAllUsesWith(assemble(builder, vty, layout,
                                  std::move(out_vreg_array), ctx.target_shape));
   op.erase();
   return success();
@@ -1528,7 +1508,6 @@ LogicalResult scf_while_rule(RewriteContext &ctx, Operation &op,
   scf::WhileOp while_op = cast<scf::WhileOp>(op);
   TPU_ASSERT_EQ_OP(layouts_in.size(), while_op->getNumOperands());
   TPU_ASSERT_EQ_OP(layouts_out.size(), while_op->getNumResults());
-  TPU_ASSERT_EQ_OP(layouts_in.size(), layouts_out.size());
 
   // The terminator for the before region is the condition op.
   // It takes multiple arguments -- the first being the decision to execute the
@@ -1537,41 +1516,44 @@ LogicalResult scf_while_rule(RewriteContext &ctx, Operation &op,
       const SmallVector<Layout> cond_in_layouts,
       getInLayouts(*while_op.getBeforeBody()->getTerminator(),
                    ctx.target_shape));
+  auto cond_arg_layouts = ArrayRef<Layout>(cond_in_layouts).drop_front(1);
 
   FAILUREOR_ASSIGN_OR_RETURN(
       const SmallVector<Layout> yield_in_layouts,
       getInLayouts(*while_op.getYieldOp(), ctx.target_shape));
-  int out_idx = 0;
-  for (auto [in_layout, cond_layout, yield_layout, out_layout, result] :
-       llvm::zip_equal(layouts_in,
-                       ArrayRef<Layout>(cond_in_layouts).drop_front(1),
-                       yield_in_layouts, layouts_out, op.getResults())) {
-    if (auto vty = dyn_cast<VectorType>(result.getType())) {
+  int in_idx = 0;
+  for (auto [in_layout, yield_layout, input] :
+       llvm::zip_equal(layouts_in, yield_in_layouts, op.getOperands())) {
+    if (auto vty = dyn_cast<VectorType>(input.getType())) {
       TPU_ASSERT_OP(in_layout.has_value());
       TPU_ASSERT_OP(yield_layout.has_value());
-      TPU_ASSERT_OP(out_layout.has_value());
-      if (in_layout.value() != cond_layout.value()) {
-        return op.emitOpError(
-                   "Not implemented: while loop input layout does not match "
-                   "with condition layout ")
-               << out_idx;
-      }
       if (in_layout.value() != yield_layout.value()) {
         return op.emitOpError(
                    "Not implemented: while loop input layout does not match "
                    "with yield layout ")
-               << out_idx;
-      }
-      if (in_layout.value() != out_layout.value()) {
-        return op.emitOpError(
-                   "Not implemented: while loop input layout does not match "
-                   "with output layout ")
-               << out_idx;
+               << in_idx;
       }
     } else {
       TPU_ASSERT_EQ_OP(in_layout, kNoLayout);
-      TPU_ASSERT_EQ_OP(cond_layout, kNoLayout);
       TPU_ASSERT_EQ_OP(yield_layout, kNoLayout);
+    }
+    ++in_idx;
+  }
+
+  int out_idx = 0;
+  for (auto [cond_layout, out_layout, output] :
+       llvm::zip_equal(cond_arg_layouts, layouts_out, op.getResults())) {
+    if (auto vty = dyn_cast<VectorType>(output.getType())) {
+      TPU_ASSERT_OP(cond_layout.has_value());
+      TPU_ASSERT_OP(out_layout.has_value());
+      if (cond_layout.value() != cond_layout.value()) {
+        return op.emitOpError(
+                   "Not implemented: while loop output layout does not match "
+                   "with condition layout ")
+               << out_idx;
+      }
+    } else {
+      TPU_ASSERT_EQ_OP(cond_layout, kNoLayout);
       TPU_ASSERT_EQ_OP(out_layout, kNoLayout);
     }
     ++out_idx;
@@ -2500,12 +2482,9 @@ LogicalResult rotate_rule_impl(RewriteContext &ctx, OpTy op, Value amount,
   if (vty.getRank() < 2) {
     return op.emitOpError("Not implemented: unsupported 1D shape");
   }
-  // TODO(b/411170715): Allow sublane rotation once the bug is fixed.
   // TODO(b/337384645): Support non-zero stride.
   if (has_padding_along_rotation &&
-      (!shift.has_value() ||
-       (rotated_tiled_dim == 0 ||
-        (rotated_tiled_dim == 1 && op.getStride().value_or(0) != 0)))) {
+      (!shift.has_value() || op.getStride().value_or(0) != 0)) {
     return op.emitOpError("Not implemented: unsupported unaligned shape");
   }
 

@@ -31,9 +31,6 @@ if sys.platform != "win32":
 else:
   pltpu = None
 
-import hypothesis as hp
-import hypothesis.strategies as hps
-
 
 jax.config.parse_flags_with_absl()
 jtu.setup_hypothesis(max_examples=100)
@@ -51,6 +48,17 @@ _JAX_DTYPES_NO_BOOL = (
 _JAX_DTYPES = (
     *_JAX_DTYPES_NO_BOOL,
     jnp.bool_,
+)
+
+_JAX_INT_DTYPES = (
+    jnp.int32,
+    jnp.int16,
+    jnp.int8,
+    jnp.int4,
+    jnp.uint32,
+    jnp.uint16,
+    jnp.uint8,
+    jnp.uint4,
 )
 
 
@@ -131,58 +139,6 @@ class OpsTest(PallasBaseTest):
       )(inp)
       self.assertAllClose(out, out_interpret)
 
-  @parameterized.product(is_dynamic=(False, True))
-  @hp.given(
-      axis=hps.integers(0, 3),
-      shift=hps.integers(0, 3),
-      stride=hps.one_of(hps.just(None), hps.integers(0, 2)),
-      # Stride dimension on the minor most is not supported.
-      stride_axis=hps.one_of(hps.just(None), hps.integers(0, 2)),
-  )
-  @hp.example(3, 9, 1, 2)
-  @hp.example(3, 9, 2, 2)
-  @hp.example(0, 9, 0, 1)
-  @hp.example(0, 9, 1, 1)
-  def test_roll(self, is_dynamic, axis, shift, stride, stride_axis):
-    if (stride is None) != (stride_axis is None):
-      self.skipTest(
-          "Roll op requires both stride and stride_axis to be either specified"
-          " or not specified."
-      )
-    if (not jtu.is_device_tpu(version=5)) and stride_axis == 2:
-      self.skipTest(
-          "Roll op with stride axis on 2nd minor requires at least TPU v5"
-      )
-    shape = (4, 4, 32, 512)
-
-    def kernel(s_ref, x_ref, y_ref):
-      amt = s_ref[0] if is_dynamic else shift
-      y_ref[...] = pltpu.roll(
-          x_ref[...], amt, axis, stride=stride, stride_axis=stride_axis
-      )
-
-    def roll(x, shift, axis, stride=None, stride_axis=None):
-      assert (stride is None) == (stride_axis is None)
-      if stride is None:
-        return np.roll(x, shift, axis)
-      outputs = [
-          np.roll(xs, shift + i * stride, axis)
-          for i, xs in enumerate(np.split(x, x.shape[stride_axis], stride_axis))
-      ]
-      return np.concatenate(outputs, stride_axis)
-
-    inp = np.arange(np.prod(shape), dtype=jnp.int32).reshape(shape)
-    ref = roll(inp, shift, axis, stride, stride_axis)
-    dynamic_shift = jnp.array([abs(shift)], jnp.int32)
-    for interpret in [False, True]:
-      out = pl.pallas_call(
-          kernel,
-          out_shape=jax.ShapeDtypeStruct(shape, jnp.int32),
-          grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=1),
-          interpret=interpret,
-      )(dynamic_shift, inp)
-      np.testing.assert_array_equal(out, ref, err_msg=f"{interpret=}")
-
   def test_interleave_vectors(self):
     if not jtu.is_device_tpu_at_least(version=4):
       self.skipTest("Expect TPUv4+")
@@ -231,21 +187,8 @@ class OpsTest(PallasBaseTest):
     )(x)
     np.testing.assert_array_equal(y, jnp.broadcast_to(x[3:4], y.shape))
 
-  def test_tpu_unsigned_int(self):
-    self.skipTest("TODO(apaszke): Unsigned upcasts were implemented incorrectly")
-    def body(x_ref, o_ref):
-      # Test cast from uint16 -> uint32
-      ux = lax.convert_element_type(x_ref[...], jnp.uint32)
-      res = ux + 1
-      # Test cast from uint32 -> float32
-      o_ref[...] = res.astype(jnp.float32)
-    out = jax.ShapeDtypeStruct((8, 128), jnp.float32)
-    x = jnp.arange(8 * 128, dtype=jnp.uint16).reshape((8, 128))
-    result = self.pallas_call(body, out_shape=out)(x)
-    np.testing.assert_array_equal(result, x.astype(jnp.float32) + 1.0)
-
   @parameterized.parameters([jnp.uint4, jnp.int4])
-  def test_tpu_int4_upcast(self, dtype):
+  def test_tpu_int4_upcast_and_matmul(self, dtype):
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("TPUv5+ needed for integer matmuls")
 
@@ -265,6 +208,32 @@ class OpsTest(PallasBaseTest):
             preferred_element_type=jnp.int32,
         ),
     )
+
+  @parameterized.product(from_dtype=_JAX_INT_DTYPES,
+                         to_dtype=_JAX_INT_DTYPES)
+  def test_integer_cast(self, from_dtype, to_dtype):
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest("Expect TPUv4+")
+    # Generate both low and high values to better cover the entire range
+    # of the source dtype.
+    min_val = from_dtype(jnp.iinfo(from_dtype).min)
+    max_val = from_dtype(jnp.iinfo(from_dtype).max)
+    if jnp.iinfo(from_dtype).bits > 4:
+      x_random = jax.random.randint(jax.random.key(0), shape=(112, 256),
+                                    minval=min_val, maxval=max_val, dtype=from_dtype)
+    else:
+      # randint does not support sub-byte types.
+      x_random = jnp.arange(112 * 256, dtype=from_dtype).reshape((112, 256))
+    arange = jnp.arange(8 * 256, dtype=from_dtype).reshape((8, 256))
+    x = jnp.concatenate([min_val + arange, x_random, max_val - arange], axis=0)
+
+    def body(x_ref, o_ref):
+      o_ref[...] = lax.convert_element_type(x_ref[...], to_dtype)
+
+    out = jax.ShapeDtypeStruct(x.shape, to_dtype)
+    expected = x.astype(to_dtype)
+    result = self.pallas_call(body, out_shape=out)(x)
+    np.testing.assert_array_equal(result, expected)
 
   def test_select_with_scalar_condition(self):
     def kernel(cond, lhs, rhs, out):
@@ -553,49 +522,55 @@ class OpsTest(PallasBaseTest):
         output[tuple(slice(0, d) for d in src_shape)], x
     )
 
-  # TODO(jevinjiang): we need to support strided load for bool.
-  @parameterized.product(dtype=_JAX_DTYPES_NO_BOOL)
-  @hp.given(
-      slice_start=hps.integers(0, 3),
-      slice_size=hps.integers(1, 3),
-      m=hps.integers(1, 32),
-      # Need to make sure the 2nd minor has no padding.
-      n=hps.sampled_from([1, 2, 4, 8, 16, 24, 32]),
-  )
-  @hp.settings(max_examples=20)  # 20 examples for each dtype.
-  def test_load_to_reshape(self, dtype, slice_start, slice_size, m, n):
-    if not jtu.if_cloud_tpu_at_least(2025, 5, 15):
-      self.skipTest("Requires libtpu built after 2025-05-15")
-    bitwidth = pallas_utils.dtype_bitwidth(dtype)
-    if jtu.get_tpu_version() < 4 and bitwidth != 32:
-      self.skipTest("Requires TPUv4+ for non-32-bit types")
-    if jtu.get_tpu_version() == 4 and bitwidth <= 8:
-      self.skipTest("Int8 is not supported on this target")
-    packing = 32 // bitwidth
-    n *= packing
-    slices = (
-        slice(slice_start, slice_start + slice_size),
-        slice(slice_start, slice_start + m),
-        slice(None),
-        slice(None),
-    )
-    inp_shape = (8, 64, n, 128)
-    out_shape = (slice_size, m, n * 128)
+  def test_while_loop_arg_num_change(self):
+    if not jtu.if_cloud_tpu_at_least(2025, 7, 17):
+      self.skipTest("Requires libtpu built after 2025-07-17")
+    # This kernel will generate a while loop that will be CSEd by MLIR to have
+    # the different number of argments in before region and after region.
+    def kernel(
+        out_ref,
+        a,
+    ):
+      def loop_cond(state):
+        _, y = state
+        return y
 
-    def kernel(inp_ref, out_ref):
-      inp = inp_ref[slices]
-      out_ref[...] = inp.reshape(out_shape)
+      def loop_body(state):
+        x, y = state
 
-    inp = rand(inp_shape, dtype, seed=1234)
-    run = pl.pallas_call(kernel, jax.ShapeDtypeStruct(out_shape, dtype))
-    output = run(inp)
-    expected = inp[slices].reshape(out_shape)
-    np.testing.assert_array_equal(output, expected)
+        def then_0():
+          def then_1():
+            return jnp.int32(0)
 
+          def else_1():
+            a[0] = a[0] + 1
 
-@jtu.thread_unsafe_test_class()  # hypothesis is not thread safe
-class OpsInterpretTest(OpsTest):
-  INTERPRET = True
+            return jnp.int32(1)
+
+          z = lax.cond(x == 0, then_1, else_1)
+          new_x = z
+          new_y = z != 0
+          return new_x, new_y
+
+        def else_0():
+          return x, jnp.bool_(False)
+
+        new_x, new_y = lax.cond(y, then_0, else_0)
+
+        return (new_x, new_y)
+
+      out_ref[0] = lax.while_loop(
+          loop_cond, loop_body, (jnp.int32(0), jnp.bool_(True))
+      )[0]
+
+    output = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), jnp.int32),
+        in_specs=(),
+        out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
+        scratch_shapes=(pltpu.SMEM((1,), jnp.int32),),
+    )()[0]
+    self.assertEqual(output, 0)
 
 
 if __name__ == "__main__":

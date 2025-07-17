@@ -316,10 +316,12 @@ class _TMEMAlloc:
   num_cols: int
   collective: bool
 
-  def alloc(self):
-    tcgen05.tmem_alloc(
+  def alloc(self) -> int:
+    """Allocates TMEM and returns the number of columns allocated."""
+    _, cols = tcgen05.tmem_alloc(
         self.addr_ref, self.num_cols, collective=self.collective, exact=False
     )
+    return cols
 
   def dealloc(self):
     addr = memref.load(self.addr_ref, [])
@@ -572,8 +574,15 @@ def _launch(
         eq = arith.CmpIPredicate.eq
         is_init_warp = arith.cmpi(eq, utils.warp_idx(sync=False), c(0, i32))
         with utils.when(is_init_warp):
+          cols_used = 0
           for alloc in tmem_allocs:
-            alloc.alloc()
+            cols_used += alloc.alloc()
+          if cols_used > tcgen05.TMEM_MAX_COLS:
+            raise ValueError(
+                "Total TMEM allocation exceeds memory limit. "
+                f"Requested {cols_used} columns which exceeds limit of "
+                f"{tcgen05.TMEM_MAX_COLS}."
+            )
           if any(alloc.collective for alloc in tmem_allocs):
             tcgen05.tmem_relinquish_alloc_permit(collective=True)
           if any(not alloc.collective for alloc in tmem_allocs):
@@ -636,7 +645,7 @@ def _lower_as_gpu_kernel(
   attrs = module.operation.attributes
   attrs["sym_name"] = ir.StringAttr.get(module_name)
   if kernel_name is None:
-    kernel_name = getattr(body, "__name__", "anonymous")
+    kernel_name = module_name
 
   # These are needed as nonlocal below.
   launch_ctx = None
@@ -648,7 +657,7 @@ def _lower_as_gpu_kernel(
         ir.Attribute.parse("#llvm.linkage<external>"),
         addr_space=ir.IntegerAttr.get(i32, 4),  # GPU constant memory.
     )
-    @func.FuncOp.from_py_func(ptr_ty, ptr_ty, name=f"mosaic_gpu_{kernel_name}")
+    @func.FuncOp.from_py_func(ptr_ty, ptr_ty, name=f"{kernel_name}_mosaic_gpu")
     def main(token_ptr, buffers):
       nonlocal launch_ctx
       token = builtin.unrealized_conversion_cast([token_ty], [token_ptr])

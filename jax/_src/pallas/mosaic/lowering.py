@@ -241,6 +241,8 @@ def _memory_space_to_tpu_memory_space(memory_space: AnyMemorySpace | None
     case pallas_core.MemorySpace.ANY:
       # Map the general ANY memory space to TPU ANY memory space
       return TPUMemorySpace.ANY
+    case pallas_core.MemorySpace.HOST:
+      return TPUMemorySpace.HOST
     case (
         pallas_core.MemorySpace.ERROR
         | pallas_core.MemorySpace.INDEX
@@ -2157,7 +2159,13 @@ def _dot_general_lowering_rule(
     raise NotImplementedError(ctx.avals_out[0].dtype)
   lhs_aval, rhs_aval = ctx.avals_in
   # This is really a matrix-vector product. It only looks like matrix-matrix.
-  if lhs_dims == (1,) and rhs_dims == (1,) and ctx.avals_in[1].shape[0] == 1:
+  if (
+      lhs_dims == (1,)
+      and rhs_dims == (1,)
+      and ctx.avals_in[1].shape[0] == 1
+      and len(ctx.avals_in[0].shape) == 2
+      and len(ctx.avals_in[1].shape) == 2
+  ):
     if ctx.avals_in[0].shape != ctx.avals_in[1].shape:
       bcast_shape = jnp.broadcast_shapes(
           ctx.avals_in[0].shape, ctx.avals_out[0].shape
@@ -2314,11 +2322,10 @@ def _convert_element_type_lowering_rule(
       return arith.truncf(out_type, x)
   elif _from(integer) and _to(integer):
     if old_bitwidth < new_bitwidth and new_bitwidth == 32:
-      if (_from(unsigned) and _to(unsigned)):
+      if _from(unsigned):
         return arith.extui(out_type, x)
-      if (_from(signed) and _to(signed)):
+      if _from(signed):
         return arith.extsi(out_type, x)
-      raise NotImplementedError(f"Unsupported cast: {old_dtype} -> {new_dtype}")
     elif old_bitwidth > new_bitwidth and old_bitwidth == 32:
       return arith.trunci(out_type, x)
     elif jnp.iinfo(old_dtype).bits == jnp.iinfo(new_dtype).bits:
@@ -2459,8 +2466,6 @@ def _gather_lowering_rule(
 
   if len(in_aval.shape) != 2:
     raise NotImplementedError("Only 2D gather is supported")
-  if pallas_utils.dtype_bitwidth(in_aval.dtype) != 32:
-    raise NotImplementedError("Only 32-bit gather is supported")
   if in_aval.shape != indices_aval.shape[:-1] != out_aval.shape:
     raise ValueError("Shape mismatch in input, indices and output")
 
@@ -2472,7 +2477,7 @@ def _gather_lowering_rule(
   # shape before lowering to Mosaic and rely on MLIR CSE to remove the reshapes.
   assert indices_aval.shape == in_aval.shape + (1,)
   recovered_indices = vector.shape_cast(
-      ir.VectorType.get(in_aval.shape, ir.IntegerType.get_signless(32)),
+      ir.VectorType.get(in_aval.shape, indices.type.element_type),
       indices,
   )
   # Note: current support for lax.gather is still very limited.
@@ -2608,7 +2613,9 @@ def _fold_and_get_constant_value(x):
     return None
 
 
-@register_lowering_rule(lax.max_p, ensure_mlir_values=False)
+@register_lowering_rule(
+    lax.max_p, ensure_mlir_values=False, kernel_types=[*tpu_core.KernelType]
+)
 def _max_lowering_rule(ctx: LoweringRuleContext, x, y):
   x, y = _bcast(x, y, ctx.avals_in[0], ctx.avals_in[1], ctx.avals_out[0])
   (aval_out,) = ctx.avals_out
@@ -2621,7 +2628,9 @@ def _max_lowering_rule(ctx: LoweringRuleContext, x, y):
   raise NotImplementedError(aval_out.dtype)
 
 
-@register_lowering_rule(lax.min_p, ensure_mlir_values=False)
+@register_lowering_rule(
+    lax.min_p, ensure_mlir_values=False, kernel_types=[*tpu_core.KernelType]
+)
 def _min_lowering_rule(ctx: LoweringRuleContext, x, y):
   x, y = _bcast(x, y, ctx.avals_in[0], ctx.avals_in[1], ctx.avals_out[0])
   (aval_out,) = ctx.avals_out
@@ -3224,7 +3233,7 @@ def _lower_while_via_fori(
   return [ub, ub, *for_out]
 
 
-@register_lowering_rule(lax.while_p)
+@register_lowering_rule(lax.while_p, kernel_types=[*tpu_core.KernelType])
 def _while_lowering_rule(
     ctx: LoweringRuleContext,
     *args,
@@ -3811,7 +3820,9 @@ def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
   return arith.remsi(arith.divsi(device_id, minor_divisor), axis_size)
 
 
-@register_lowering_rule(tpu_primitives.get_barrier_semaphore_p)
+@register_lowering_rule(
+    tpu_primitives.get_barrier_semaphore_p, kernel_types=[*tpu_core.KernelType]
+)
 def _get_barrier_semaphore_rule(ctx: LoweringRuleContext):
   memref_type = aval_to_ir_type(
       ctx.lowering_context.dynamic_shape_replacement_fn, ctx.avals_out[0]

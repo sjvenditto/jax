@@ -59,7 +59,7 @@ from jax._src.lib import xla_client
 from jax._src import traceback_util
 from jax._src.typing import Array, DimSize, Shape
 from jax._src import typing
-from jax._src import xla_metadata as xla_metadata_lib
+from jax._src import xla_metadata_lib
 
 traceback_util.register_exclusion(__file__)
 
@@ -527,18 +527,24 @@ class Literal:
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
     del context  # unused
     dtype = getattr(self.aval, 'dtype', None)
+    val_str = str(self.val) if not np.shape(self.val) else "[...]"
     if print_dtype and dtype:
-      return f'{self.val}:{self.aval.str_short(short_dtypes=True)}'
+      return f'{val_str}:{self.aval.str_short(short_dtypes=True)}'
     else:
-      return f'{self.val}'
+      return f'{val_str}'
 
   def __repr__(self):
-    return f'{self.val}'
+    return f'Literal({self.val})'
 
+# The types of constants that can be used with core.Literal. Other constants
+# end up as `constvars`.
 literalable_types: set[type] = set()
 
 def is_literalable(x: Any) -> bool:
-  return type(x) in dtypes.python_scalar_dtypes or (type(x) in literalable_types and not np.shape(x))
+  for t in type(x).__mro__:
+    if t in literalable_types:
+      return (not np.shape(x) or config.use_simplified_jaxpr_constants.value)
+  return False
 
 Atom = Union[Var, Literal]
 
@@ -2248,8 +2254,8 @@ def standard_insert_pvary(*args):
     return args
   if not args:
     return args
-  in_vma = [frozenset() if (aval := get_aval(a)) is abstract_token
-            else aval.vma for a in args]  # pytype: disable=attribute-error
+  in_vma = [aval.vma if isinstance(aval := get_aval(a), ShapedArray)
+            else frozenset() for a in args]
   out_vma = frozenset.union(*in_vma)
   return [
       pvary(arg, tuple(n for n in out_vma if n not in src))
@@ -3153,7 +3159,7 @@ def _check_jaxpr(
       for eff in eqn.effects:
         if isinstance(eff, effects.JaxprInputEffect):
           eqn_invar = eqn.invars[eff.input_index]
-          if eqn_invar in mut_arrays:
+          if type(eqn_invar) is Literal or eqn_invar in mut_arrays:
             continue
           if (jaxpr_index := in_idx.get(eqn_invar, sentinel)) is sentinel:
             raise JaxprTypeError(

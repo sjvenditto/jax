@@ -20,12 +20,13 @@ from collections.abc import Callable, Sequence, Set
 import dataclasses
 import enum
 import itertools
-from typing import cast
+from typing import assert_never, cast
 
 from jax._src.lib import mosaic_gpu_dialect as mgpu  # noqa: F401
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import math as mlir_math
+from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 import numpy as np
 
@@ -411,6 +412,81 @@ def _constant_equation_system(
   return system, {variable: [result]}
 
 
+def _terminator(
+    block: ir.Block, expected_terminator: type[ir.OpView]
+) -> ir.OpView:
+  """Returns the terminator of the given block.
+
+  Checks that the terminator is of the expected type.
+  """
+  terminator = block.operations[len(block.operations) - 1]
+  assert isinstance(terminator, expected_terminator)
+  return terminator.opview
+
+
+@_add_equation_system_derivation_rule(scf.ForOp)
+def _for_equation_system(
+    op: scf.ForOp
+) -> tuple[eqns.EquationSystem, OperandOrResultsForVariable]:
+  [block] = op.region.blocks
+  yield_op = _terminator(block, scf.YieldOp)
+  operand_or_results_for_variable: OperandOrResultsForVariable = {}
+
+  # Account for the lower bound, upper bound, and step of the loop, which appear
+  # in the operands but not in the results.
+  num_leading_args = 3
+  for index, o in enumerate(op.operands):
+    if not is_vector(o):
+      continue
+    result_index = index - num_leading_args
+    operand = OperandOrResult(op, VariableType.OPERAND, index)
+    result = OperandOrResult(op, VariableType.RESULT, result_index)
+    yield_operand = OperandOrResult(
+        yield_op, VariableType.OPERAND, result_index
+    )
+    operand_or_results_for_variable[eqns.Variable(operand)] = [
+        operand, result, yield_operand,
+    ]
+
+  return eqns.EquationSystem(), operand_or_results_for_variable
+
+
+@_add_equation_system_derivation_rule(scf.WhileOp)
+def _while_equation_system(
+    op: scf.WhileOp,
+) -> tuple[eqns.EquationSystem, OperandOrResultsForVariable]:
+  [before_block] = op.before.blocks
+  [after_block] = op.after.blocks
+  cond_op = _terminator(before_block, scf.ConditionOp)
+  yield_op = _terminator(after_block, scf.YieldOp)
+
+  operand_or_results_for_variable: OperandOrResultsForVariable = {}
+
+  for operand_or_result in operands_and_results(op):
+    match operand_or_result.type:
+      case VariableType.OPERAND:
+        yield_operand = OperandOrResult(
+            yield_op, VariableType.OPERAND, operand_or_result.index
+        )
+        operand_or_results_for_variable[eqns.Variable(operand_or_result)] = [
+            operand_or_result,
+            yield_operand,
+        ]
+      case VariableType.RESULT:
+        # Increment by 1 to account for the conditional.
+        cond_operand = OperandOrResult(
+            cond_op, VariableType.OPERAND, operand_or_result.index + 1
+        )
+        operand_or_results_for_variable[eqns.Variable(operand_or_result)] = [
+            operand_or_result,
+            cond_operand,
+        ]
+      case _ as never:
+        assert_never(never)
+
+  return eqns.EquationSystem(), operand_or_results_for_variable
+
+
 @_add_equation_system_derivation_rule(mgpu.LayoutCastOp)
 def _layout_cast_equation_system(
     op: mgpu.LayoutCastOp
@@ -519,7 +595,11 @@ def operands_and_results(op: ir.OpView) -> list[OperandOrResult]:
 
 
 def producer_result(operand: OperandOrResult) -> OperandOrResult:
-  """Given an operand, returns the corresponding result in its producer."""
+  """Given an operand, returns the corresponding result in its producer.
+
+  When the producer is a block, we return the corresponding operand in the
+  operation that owns the block.
+  """
   assert operand.type == VariableType.OPERAND
   value = operand.operation.operands[operand.index]
   producer = value.owner
@@ -531,8 +611,17 @@ def producer_result(operand: OperandOrResult) -> OperandOrResult:
   # depending on function parameters, or loop block arguments.
   if isinstance(producer, ir.Block):
     index = list(cast(ir.Block, producer).arguments).index(value)
-    producer = producer.owner.opview
-    return OperandOrResult(producer, VariableType.OPERAND, index)
+    if isinstance(producer.owner, scf.ForOp):
+      # In this case, the block arguments are offset compared to the loop
+      # operands. The loop operands have the lower bound, upper bound, and step
+      # as their leading arguments. The block arguments omit these parameters,
+      # but start with the iteration variable.
+      num_leading_args = 3
+      index += num_leading_args - 1
+      return OperandOrResult(producer.owner.opview, VariableType.OPERAND, index)
+    raise NotImplementedError(
+        f"Producer {producer} is not a ForOp or a FuncOp: {type(producer)}."
+    )
 
   raise TypeError(
       f"Producer {producer} is not an operation nor a block: {type(producer)}."
@@ -589,12 +678,20 @@ def derive_hints(
   return hints
 
 
+def is_terminator(op: ir.OpView) -> bool:
+  return isinstance(op, (scf.YieldOp, scf.ConditionOp))
+
+
 def infer_layout(module: ir.Module):
   global_equation_system = eqns.EquationSystem()
   operand_and_results_for_variable: OperandOrResultsForVariable = {}
 
   def gather_equations(op: ir.Operation):
-    if not inference_utils.should_have_layout(op):
+    # Terminator ops are handled directly by the op whose region they belong to.
+    # This is because they need to be in sync with their parent op's inputs and
+    # outputs---and the parent op's equations therefore need to take them them
+    # into account.
+    if not inference_utils.should_have_layout(op) or is_terminator(op):
       return
     elif rule := _equation_system_derivation_rules.get(op.OPERATION_NAME, None):  # pytype: disable=attribute-error
       pass

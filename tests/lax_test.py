@@ -2422,7 +2422,7 @@ class LaxTest(jtu.JaxTestCase):
                                window_dimensions=window_dimensions)
     # With a stride of 1 in each direction and a padding of 'SAME', the
     # shape of the input should be equal to the shape of the result according
-    # to https://www.tensorflow.org/xla/operation_semantics#reducewindow.
+    # to https://www.openxla.org/xla/operation_semantics#reducewindow.
     self.assertEqual(shape, result.shape)
 
   def testReduceWindowWithEmptyOutput(self):
@@ -4806,9 +4806,14 @@ class CompositeTest(jtu.JaxTestCase):
 
     # The constant must not appear as an extra input argument to the composite.
     mlir_module = jax.jit(partial(my_consts, scale=scale)).lower(x).as_text()
-    self.assertIn(
-        "@my.consts(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>) -> tensor<3xf32>", mlir_module
-    )
+    if config.use_simplified_jaxpr_constants.value:
+      self.assertIn(
+          "@my.consts(%arg0: tensor<3xf32>) -> tensor<3xf32>", mlir_module
+      )
+    else:
+      self.assertIn(
+          "@my.consts(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>) -> tensor<3xf32>", mlir_module
+      )
 
   def test_composite_with_tracer_consts(self):
     def fun(x, scale):

@@ -629,6 +629,11 @@ class VectorLayoutInferer {
 
     SmallVector<Layout, 4> in_layouts = getLayoutFromOperands(op);
 
+    // The "after" region takes as arguments the values produced by the
+    // "before" region and uses `scf.yield` to supply new arguments for the
+    // "before" region. In other words, (op.inputs, beforeBody.inputs,
+    // afterBody.outputs) need to match each other and (op.outputs,
+    // beforeBody.outputs, afterBody.inputs) need to match each other.
     if (assumeLayoutsForBlockArgs(*op.getBeforeBody(), in_layouts).failed() ||
         inferBlock(*op.getBeforeBody(), match_condition).failed()) {
       return op.emitOpError(
@@ -636,50 +641,48 @@ class VectorLayoutInferer {
           "scf.while op");
     }
 
-    if (assumeLayoutsForBlockArgs(*op.getAfterBody(), in_layouts).failed() ||
+    auto *cond_op = op.getBeforeBody()->getTerminator();
+    auto cond_in_layouts = getLayoutFromOperands(cond_op);
+    auto cond_arg_layouts = ArrayRef<Layout>(cond_in_layouts).drop_front(1);
+
+    if (assumeLayoutsForBlockArgs(*op.getAfterBody(), cond_arg_layouts)
+            .failed() ||
         inferBlock(*op.getAfterBody(), match_yield).failed()) {
       return op.emitOpError(
           "failed to infer layout with initial layouts for after body in "
           "scf.while op");
     }
 
-    auto *cond_op = op.getBeforeBody()->getTerminator();
-    auto cond_in_layouts = getLayoutFromOperands(cond_op);
     auto *yield_op = op.getAfterBody()->getTerminator();
     auto yield_in_layouts = getLayoutFromOperands(yield_op);
 
-    // Find a compatible layout from condition body and loop body for each
-    // result. For example, if we yield offset (*, *) in condition body and
+    // Find a compatible layout from before body's inputs and after body's
+    // outputs. For example, if we yield offset (*, *) in condition body and
     // offset (*, 0) in loop body, the result offset should be (*, 0).
-    SmallVector<Layout, 4> out_layouts;
-    out_layouts.reserve(op->getNumResults());
-    int out_idx = 0;
+    SmallVector<Layout, 4> carry_layouts;
+    carry_layouts.reserve(op->getNumOperands());
+    int carry_idx = 0;
     bool require_reinfer = false;
-    for (auto [in_layout, cond_layout, yield_layout, result] : llvm::zip_equal(
-             in_layouts, ArrayRef<Layout>(cond_in_layouts).drop_front(1),
-             yield_in_layouts, op.getResults())) {
-      if (auto vty = dyn_cast<VectorType>(result.getType())) {
+
+    // We only need to find compatible layouts for inputs layout of before body
+    // and output layout of the after body because the latter will be passed as
+    // inputs to the former.
+    for (auto [in_layout, yield_layout, input] :
+         llvm::zip_equal(in_layouts, yield_in_layouts, op.getOperands())) {
+      if (auto vty = dyn_cast<VectorType>(input.getType())) {
         if (!in_layout.has_value()) {
           return op.emitOpError("expected a vector layout for whileOp input ")
-                 << out_idx;
-        }
-        if (!cond_layout.has_value()) {
-          return op.emitOpError("expected a vector layout for condition input ")
-                 << out_idx + 1;  // ConditionOp's first input is 1 bit bool.
+                 << carry_idx;
         }
         if (!yield_layout.has_value()) {
           return op.emitOpError("expected a vector layout for yield input ")
-                 << out_idx;
+                 << carry_idx;
         }
         auto compatible_layout = VectorLayout::join(
-            cond_layout.value(), yield_layout.value(), vty.getShape());
-        if (compatible_layout.has_value()) {
-          compatible_layout = VectorLayout::join(
-              in_layout.value(), compatible_layout.value(), vty.getShape());
-        }
-        // If no compatible layout is found in layouts for input, condition and
-        // yield, the output layout falls back to a normalized layout which
-        // has offsets 0 and the native tiling.
+            in_layout.value(), yield_layout.value(), vty.getShape());
+        // If no compatible layout is found in layouts for input and yield, the
+        // output layout falls back to a normalized layout which has offsets 0
+        // and the native tiling.
         if (!compatible_layout.has_value()) {
           compatible_layout = VectorLayout(in_layout->bitwidth(), {0, 0},
                                            nativeTiling(in_layout->bitwidth()),
@@ -687,27 +690,22 @@ class VectorLayoutInferer {
         }
         if (!require_reinfer &&
             (compatible_layout.value() != in_layout.value() ||
-             compatible_layout.value() != cond_layout.value() ||
              compatible_layout.value() != yield_layout.value())) {
           require_reinfer = true;
         }
-        out_layouts.push_back(compatible_layout);
+        carry_layouts.push_back(compatible_layout);
       } else {
         if (in_layout.has_value()) {
           return op.emitOpError("expected no layout for whileOp input ")
-                 << out_idx;
-        }
-        if (cond_layout.has_value()) {
-          return op.emitOpError("expected no layout for condition input ")
-                 << out_idx + 1;  // ConditionOp's first input is 1 bit bool.
+                 << carry_idx;
         }
         if (yield_layout.has_value()) {
           return op.emitOpError("expected no layout for yield input ")
-                 << out_idx;
+                 << carry_idx;
         }
-        out_layouts.push_back(kNoLayout);
+        carry_layouts.push_back(kNoLayout);
       }
-      ++out_idx;
+      ++carry_idx;
     }
     if (require_reinfer) {
       clearBlockLayouts(*op.getBeforeBody());
@@ -718,25 +716,33 @@ class VectorLayoutInferer {
       // consistent across all branches. To ensure that, we need to reprocess
       // layout inference for the entire body with the final consolidated
       // layout.
-      if (assumeLayoutsForBlockArgs(*op.getBeforeBody(), out_layouts)
+      if (assumeLayoutsForBlockArgs(*op.getBeforeBody(), carry_layouts)
               .failed() ||
           inferBlock(*op.getBeforeBody(), match_condition).failed()) {
         return op.emitOpError(
             "failed to infer layout with compatible layouts for before body in "
             "scf.while op");
       }
-      if (assumeLayoutsForBlockArgs(*op.getAfterBody(), out_layouts).failed() ||
+
+      cond_op = op.getBeforeBody()->getTerminator();
+      cond_in_layouts = getLayoutFromOperands(cond_op);
+      cond_arg_layouts = ArrayRef<Layout>(cond_in_layouts).drop_front(1);
+
+      if (assumeLayoutsForBlockArgs(*op.getAfterBody(), cond_arg_layouts)
+              .failed() ||
           inferBlock(*op.getAfterBody(), match_yield).failed()) {
         return op.emitOpError(
             "failed to infer layout with compatible layouts for after body in "
             "scf.while op");
       }
     }
-    std::copy(out_layouts.begin(), out_layouts.end(),
-              cond_in_layouts.begin() + 1);  // Skip the first 1 bit bool.
+
+    // The input layouts should be set as the consolidated carry layouts and
+    // the output layouts should be set as the condition arg layouts which is
+    // inferred along the way when input layouts are determined.
     setInLayout(cond_op, cond_in_layouts);
-    setInLayout(yield_op, out_layouts);
-    setLayout(op, out_layouts, out_layouts);
+    setInLayout(yield_op, carry_layouts);
+    setLayout(op, carry_layouts, cond_arg_layouts);
     return success();
   }
 
@@ -1844,7 +1850,6 @@ class VectorLayoutInferer {
     // types, so make sure we infer layout based on a shaped-typed operand.
     std::optional<VectorLayout> out_layout_candidate;
     std::optional<VectorLayout> out_layout;
-    SmallVector<std::optional<Layout>, 4> in_layouts;
     int64_t bitwidth = -1;
     // Find the bitwidth of the operands/results. They must all be the same
     // except for the case of i1s, which use a "fake" bitwidth for layouts.
@@ -1874,24 +1879,19 @@ class VectorLayoutInferer {
           DCHECK(!out_layout.has_value());
           bitwidth = layout.bitwidth();
           out_layout = layout;
-          in_layouts.push_back(layout);
         } else if (bitwidth != layout.bitwidth()) {
           DCHECK_EQ(vty.getElementTypeBitWidth(), 1);
-          in_layouts.push_back(std::nullopt);
         } else if (is_fully_replicated(some_layout)) {
           // If the input is fully replicated, don't use it to commit to any
           // layout. Replicated values are easy to relayout.
-          in_layouts.push_back(std::nullopt);
           out_layout_candidate = layout;
         } else if (!out_layout) {
           // TODO(apaszke): There are probably smarter ways to choose layout.
           out_layout = layout;
-          in_layouts.push_back(some_layout);
         } else {
           if (auto new_out =
                   VectorLayout::join(layout, *out_layout, vty.getShape())) {
             out_layout = *new_out;
-            in_layouts.push_back(some_layout);
           } else {
             // When we detect a layout conflict we cannot reconcile, we remove
             // any replication bits that might have been present in out_layout,
@@ -1903,17 +1903,15 @@ class VectorLayoutInferer {
                              {out_layout->offsets()[0].value_or(0),
                               out_layout->offsets()[1].value_or(0)},
                              out_layout->tiling(), out_layout->implicit_dim());
-            in_layouts.push_back(std::nullopt);
           }
         }
       } else {
         TPU_CHECK_OP(op->getOperand(i).getType().isSignlessIntOrIndexOrFloat(),
                      "expected only vector and scalar operands");
-        in_layouts.push_back({kNoLayout});
       }
     }
     Layout final_out_layout = std::nullopt;
-    if (auto out_vty = dyn_cast<VectorType>(op->getResult(0).getType())) {
+    if (isa<VectorType>(op->getResult(0).getType())) {
       if (out_layout) {
         final_out_layout = *out_layout;
       } else if (out_layout_candidate) {
@@ -1924,14 +1922,11 @@ class VectorLayoutInferer {
         return failure();
       }
     }
-    CHECK_EQ(in_layouts.size(), op->getNumOperands()) << Print(op);
-    SmallVector<Layout, 4> final_in_layouts;
-    for (int i = 0; i < in_layouts.size(); ++i) {
-      if (in_layouts[i]) {
-        final_in_layouts.push_back(*in_layouts[i]);
-      } else {
-        final_in_layouts.push_back(final_out_layout);
-      }
+    SmallVector<Layout> final_in_layouts(op->getNumOperands());
+    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+      final_in_layouts[i] = isa<VectorType>(op->getOperand(i).getType())
+                                ? final_out_layout
+                                : kNoLayout;
     }
     setLayout(op, final_in_layouts, final_out_layout);
     return success();

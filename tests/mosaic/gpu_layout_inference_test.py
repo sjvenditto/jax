@@ -324,7 +324,6 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
   def test_infer_layout_from_yield_op_in_layouts_for_for_op(
       self, shape, layout
   ):
-    self.skip_if_equations()
     with ir.InsertionPoint(self.module.body):
       ab_type = ir.VectorType.get(shape, ir.BF16Type.get())
       i32 = ir.IntegerType.get_signless(32)
@@ -359,7 +358,6 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
       self.checkOutLayouts(for_op, carry_layouts)
 
   def test_infer_layout_from_body_op_to_yield_op_to_for_op(self):
-    self.skip_if_equations()
     shape = (64, 64)
     with ir.InsertionPoint(self.module.body):
       c_ty = ir.VectorType.get(shape, ir.BF16Type.get())
@@ -391,7 +389,6 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
   def test_infer_while_op_layouts(
       self, init_shape, init_layout, result_shape, result_layout
   ):
-    self.skip_if_equations()
     f32 = ir.F32Type.get()
     in_type = ir.VectorType.get(init_shape, f32) if init_shape else f32
     out_type = ir.VectorType.get(result_shape, f32) if result_shape else f32

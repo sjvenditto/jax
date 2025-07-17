@@ -29,6 +29,7 @@ import numpy as np
 
 import jax
 from jax._src import core
+from jax._src import config
 from jax import dtypes
 from jax import lax
 from jax import random
@@ -2788,10 +2789,13 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     x = jnp.asarray(rng.randn(32, 2, 32).astype('float32'))
     _, vjp_fun = jax.vjp(cumprod, x)
 
+    # TODO(mattjj): should we re-enable this check? The constants are now
+    # inlined in the Jaxprs, not easy to find them.
     # Need to spelunk into vjp_fun. This is fragile, and if it causes problems
     # just skip this test and make an issue for mattjj.
-    *_, ext_res = vjp_fun.args[0].args[0]
-    self.assertIs(ext_res, x)
+    if not config.use_simplified_jaxpr_constants.value:
+      *_, ext_res = vjp_fun.args[0].args[0]
+      self.assertIs(ext_res, x)
 
     if remat is not None:
       # TODO(mattjj): make the numpy.ndarray test pass w/ remat
@@ -3486,6 +3490,12 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(final, final_ref, check_dtypes=False)
     self.assertAllClose(outs, outs_ref, check_dtypes=False)
     self.assertAllClose(xs_bar, xs_bar_ref, check_dtypes=False)
+
+  def test_scan_fixpoint_instantiate(self):
+    def f(x):
+      c, () = jax.lax.scan(lambda c, _: ((0., 0.), ()), (x, 0.), (), length=5)
+      return sum(c)
+    jax.grad(f)(1.)  # doesn't crash
 
 
 if __name__ == '__main__':

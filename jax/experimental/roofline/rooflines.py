@@ -23,6 +23,7 @@ from jax._src import ad_util
 from jax._src import core, util
 from jax._src import dispatch
 from jax._src import ops
+from jax._src import pjit
 from jax._src import prng
 from jax._src import random
 from jax._src import shard_map
@@ -54,6 +55,7 @@ for prim in it.chain(
   lax.__dict__.values(),
   linalg.__dict__.values(),
   ops.__dict__.values(),
+  [pjit.sharding_constraint_p],
   prng.__dict__.values(),
   random.__dict__.values(),
   shard_map.__dict__.values(),
@@ -505,10 +507,40 @@ roofline.register_roofline(lax_parallel.all_gather_p)(
 )
 
 
+def _calculate_gather_flops(
+    mode: slicing.GatherScatterMode,
+    indices_size: int,
+    output_size: int,
+) -> int:
+  """Calculates roofline unfused flops for Jax's gather primitive."""
+
+  if mode == slicing.GatherScatterMode.FILL_OR_DROP:
+    # With FILL_OR_DROP, we have 4 steps to check whether to fill (or drop):
+    # 1. Check if the index is within upper bound.
+    # 2. Check if the index is within lower bound.
+    # 3. Call `and` on #1 and #2 to check the index is "in bounds".
+    # 4. `reduce` the result to a single boolean per window.
+    # Each of the steps is a single elementwise op on the indices.
+    index_check_flops = indices_size * 4
+
+    # Once we know whether to fill or drop (per window), there are 2 steps to
+    # mask the output:
+    # 1. Broadcast the per-window boolean to the output shape.
+    # 2. Choose whether to fill (from `operand`) if in-bounds, or drop if
+    #    out-of-bounds.
+    # Broadcasting is free, but choosing whether to fill or drop involves an
+    # elementwise op the size of the output.
+    output_mask_flops = output_size
+    return index_check_flops + output_mask_flops
+
+  return 0
+
+
 @roofline.register_roofline(slicing.gather_p)
 def _gather_roofline(
     ctx: roofline.RooflineRuleContext,
     *args,
+    mode: slicing.GatherScatterMode,
     **kw,
 ) -> roofline.RooflineResult:
   _, indices = (roofline.RooflineShape.from_aval(aval) for aval in ctx.avals_in)
@@ -516,14 +548,13 @@ def _gather_roofline(
 
   # Gather doesn't read the whole input buffer, it's equivalent to a copy the
   # size of the output shape and a read of the gather indices.
-  bytes = (
+  unfused_hbm_bytes = (
       out.dtype.itemsize * out.size * 2 + indices.dtype.itemsize * indices.size
   )
 
   return roofline.RooflineResult(
-      # Gather does not issue any flops.
-      unfused_flops=0,
-      unfused_hbm_bytes=bytes,
+      unfused_flops=_calculate_gather_flops(mode, indices.size, out.size),
+      unfused_hbm_bytes=unfused_hbm_bytes,
   )
 
 
